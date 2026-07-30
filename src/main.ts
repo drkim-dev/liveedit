@@ -1,5 +1,5 @@
 import { MarkdownView, Notice, Plugin } from "obsidian";
-import { buildHealthUrl, buildRoomUrl, LiveEditConnection } from "./connection";
+import { buildHealthUrl, buildRoomUrl, ConnectionStatus, LiveEditConnection } from "./connection";
 import { createLiveEditExtension, ActiveSession } from "./editor-binding";
 import { FileSync } from "./file-sync";
 import { ParticipantsModal, StatusBarWidget } from "./presence";
@@ -21,6 +21,10 @@ export default class LiveEditPlugin extends Plugin {
   // sync and end up bound to an orphaned Y.Text that the room's map never
   // ends up pointing at (looks like "cursors sync, text doesn't").
   private ready = false;
+  // Once true, status flips (disconnect/reconnect) trigger user-facing
+  // notices. Stays false during the very first connect() so we don't warn
+  // about "disconnected" while just starting up.
+  private hasBeenReady = false;
   private statusBar!: StatusBarWidget;
   private unsubscribeStatus: (() => void) | null = null;
   private awarenessChangeHandler: (() => void) | null = null;
@@ -113,9 +117,23 @@ export default class LiveEditPlugin extends Plugin {
       this.statusBar.render(connection.status, Math.max(0, remoteCount), this.settings.role);
     };
 
+    const handleStatusChange = (status: ConnectionStatus): void => {
+      refreshStatusBar();
+      if (!this.hasBeenReady) return; // this is just the initial connect settling in, not a real drop
+      if (status === "disconnected") {
+        new Notice(
+          "⚠️ LiveEdit 연결이 끊어졌습니다. 재연결을 시도하는 중입니다. 지금 입력하는 내용은 재연결되는 순간 팀의 최신 내용으로 대체될 수 있으니 잠시 기다려주세요.",
+          10000,
+        );
+      } else if (status === "connected") {
+        new Notice("LiveEdit: 다시 연결되었습니다.");
+        this.nudgeOpenEditors();
+      }
+    };
+
     this.awarenessChangeHandler = refreshStatusBar;
     connection.awareness.on("change", refreshStatusBar);
-    this.unsubscribeStatus = connection.onStatusChange(refreshStatusBar);
+    this.unsubscribeStatus = connection.onStatusChange(handleStatusChange);
     refreshStatusBar();
 
     connection.connect();
@@ -126,6 +144,7 @@ export default class LiveEditPlugin extends Plugin {
     // Only now is it safe for editors to bind to shared Y.Text instances.
     if (this.connection === connection) {
       this.ready = true;
+      this.hasBeenReady = true;
       this.nudgeOpenEditors();
     }
   }
@@ -148,6 +167,7 @@ export default class LiveEditPlugin extends Plugin {
   disconnect(): void {
     if (!this.connection) return;
     this.ready = false;
+    this.hasBeenReady = false;
     this.unsubscribeStatus?.();
     this.unsubscribeStatus = null;
     if (this.awarenessChangeHandler) {

@@ -29,3 +29,11 @@
   font-size: var(--font-ui-smaller);
   margin-left: auto;
 }
+
+/* y-codemirror.next hides the remote-cursor name label until hover by default
+   (opacity: 0). Show it persistently, Notion-style. */
+.cm-ySelectionInfo {
+  opacity: 1 !important;
+  border-radius: 3px;
+  padding: 1px 4px !important;
+}

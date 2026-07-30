@@ -24,6 +24,8 @@ export interface EditorBindingDeps {
 }
 
 const collabCompartment = new Compartment();
+/** How often to double-check an unfocused-but-bound editor against the shared doc. */
+const RECONCILE_INTERVAL_MS = 5000;
 
 /**
  * Global CM6 extension: for every editor pane, tracks which file it currently
@@ -43,9 +45,15 @@ export function createLiveEditExtension(deps: EditorBindingDeps): Extension {
         /** Path fileSync currently believes is open in this pane. */
         boundPath: string | null = null;
         destroyed = false;
+        reconcileTimer: number;
 
         constructor(view: EditorView) {
           this.check(view);
+          // Safety net: while this pane isn't focused (so we can't clobber an
+          // in-progress keystroke), periodically make sure it still matches the
+          // shared doc. Normal typing/remote edits are handled live by yCollab —
+          // this only ever does something if that somehow missed an update.
+          this.reconcileTimer = window.setInterval(() => this.reconcile(view), RECONCILE_INTERVAL_MS);
         }
 
         update(update: ViewUpdate): void {
@@ -54,7 +62,21 @@ export function createLiveEditExtension(deps: EditorBindingDeps): Extension {
 
         destroy(): void {
           this.destroyed = true;
+          window.clearInterval(this.reconcileTimer);
           if (this.boundPath) this.lastSeenSession?.fileSync.markClosed(this.boundPath);
+        }
+
+        reconcile(view: EditorView): void {
+          if (this.destroyed || !this.boundPath || view.hasFocus) return;
+          const session = this.lastSeenSession;
+          if (!session || !session.fileSync.hasText(this.boundPath)) return;
+          const ytext = session.fileSync.getOrCreateText(this.boundPath);
+          const sharedContent = ytext.toString();
+          if (view.state.doc.toString() !== sharedContent) {
+            view.dispatch({
+              changes: { from: 0, to: view.state.doc.length, insert: sharedContent },
+            });
+          }
         }
 
         check(view: EditorView): void {
