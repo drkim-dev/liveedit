@@ -1,0 +1,31 @@
+.liveedit-status {
+  font-size: var(--font-ui-smaller);
+  white-space: nowrap;
+}
+
+.liveedit-participant-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.liveedit-participant {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.liveedit-color-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.liveedit-participant-file {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-left: auto;
+}

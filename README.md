@@ -1,2 +1,108 @@
-# liveedit
-obsidian live edit plugin
+# LiveEdit
+
+같은 사설망(회사 내부망/VPN)에 있는 팀원끼리, 노션처럼 Obsidian 노트를 실시간으로
+같이 보고 편집하는 아주 가벼운 플러그인입니다. 호스트/게스트 구분 없이 모두가
+동등하게 편집하며, 문서 내용은 CRDT(Yjs)로 병합되어 편집 충돌이 나지 않습니다.
+
+암호화, 로그인, 권한 관리, 첨부파일/캔버스 동기화 같은 기능은 일부러 넣지 않았습니다.
+내부망에서 팀끼리만 쓰는 용도이므로 마크다운 노트 실시간 동기화 하나에만 집중합니다.
+
+> 팀원이 설치·사용하는 방법만 필요하다면 **[docs/사용법.md](docs/사용법.md)** 를 보내주세요.
+> 이 README는 서버 운영/빌드/배포를 맡는 사람을 위한 문서입니다.
+
+## 구성
+
+- `server/` — 팀 내부망에 상시로 띄워두는 아주 작은 릴레이 서버 (Node.js)
+- `src/` — Obsidian 플러그인 소스 (빌드하면 저장소 루트에 `main.js`가 생성됨)
+
+## 1. 릴레이 서버 띄우기
+
+```bash
+cd server
+npm install
+npm run build
+node dist/server.js
+```
+
+기본 포트는 `1234`입니다. 포트나 접속 토큰을 바꾸고 싶을 때만 환경변수를 설정하면
+되는데, 셸마다 문법이 달라서 아래 중 본인 환경에 맞는 걸 쓰세요.
+
+- **Windows cmd.exe**
+  ```bat
+  set PORT=1234
+  set LIVEEDIT_TOKEN=팀비밀값
+  node dist/server.js
+  ```
+  (한 줄로 하려면: `set PORT=1234 && node dist/server.js` — `PORT=1234 node ...`처럼
+  유닉스식으로 쓰면 "내부 또는 외부 명령이 아닙니다" 오류가 납니다)
+
+- **Windows PowerShell**
+  ```powershell
+  $env:PORT = "1234"
+  $env:LIVEEDIT_TOKEN = "팀비밀값"
+  node dist/server.js
+  ```
+
+- **macOS / Linux / Git Bash**
+  ```bash
+  PORT=1234 LIVEEDIT_TOKEN=팀비밀값 node dist/server.js
+  ```
+
+환경변수 설명:
+- `PORT` (기본 1234): 리슨 포트
+- `LIVEEDIT_TOKEN` (선택): 설정하면 이 값을 아는 사람만 접속 가능 (없으면 사설망 내
+  누구나 접속 가능 — 내부망이라면 굳이 필요 없음)
+- 상태 확인: `GET http://서버주소:포트/healthz`
+
+사내 서버나 팀원 PC 등 항상 켜져 있는 곳에 올려두고, 팀원들에게 `ws://내부IP:포트`
+주소만 공유하면 됩니다. (터미널을 닫으면 서버도 같이 꺼지니, 계속 띄워두려면
+Windows에서는 [PM2](https://pm2.keymetrics.io/) 같은 프로세스 매니저나 작업 스케줄러
+활용을 추천합니다.)
+
+## 2. 플러그인 설치 (BRAT)
+
+1. Obsidian 커뮤니티 플러그인에서 **BRAT**(Obsidian42 - BRAT) 설치 후 활성화
+2. BRAT 설정 → `Add Beta plugin` → 저장소 경로에 `<깃허브아이디>/liveedit` 입력
+3. 설치 후 커뮤니티 플러그인 목록에서 **LiveEdit** 활성화
+
+> BRAT는 GitHub Release에 첨부된 `main.js` / `manifest.json` / `styles.css`를 내려받습니다.
+> 이 저장소는 태그를 push하면 (`.github/workflows/release.yml`) 자동으로 릴리즈를
+> 만들고 세 파일을 첨부하도록 되어 있습니다. 새 버전을 배포하려면:
+>
+> ```bash
+> npm version patch   # package.json/manifest.json/versions.json 버전 동기화
+> git push --follow-tags
+> ```
+
+## 3. 설정
+
+플러그인 설정 탭에서:
+
+- **릴레이 서버 주소**: 위에서 띄운 서버 주소 (예: `ws://192.168.0.10:1234`)
+- **방 코드**: 같은 코드를 쓰는 사람끼리만 같은 내용을 공유 (팀/프로젝트별로 다르게 써도 됨)
+- **표시 이름 / 커서 색상**: 다른 팀원에게 보여지는 내 정보
+- **공유 폴더**: 비워두면 vault 전체, 특정 폴더만 공유하려면 경로 입력 (예: `Team`)
+- **자동 재연결**: 연결 끊기면 자동 재시도 + Obsidian 시작 시 자동 접속
+
+## 4. 사용
+
+명령 팔레트(Ctrl/Cmd+P)에서:
+
+- `LiveEdit: 세션 연결`
+- `LiveEdit: 세션 연결 해제`
+- `LiveEdit: 참여자 보기`
+
+상태바의 `LiveEdit` 표시를 클릭해도 참여자 목록이 열립니다.
+
+같은 노트를 동시에 열면 문자 단위로 실시간 반영되고, 서로 다른 노트를 보고 있어도
+백그라운드에서 계속 최신 내용으로 동기화됩니다. 새 노트를 만들거나 지우면 팀원
+vault에도 그대로 반영됩니다.
+
+## 알려진 제한사항 (의도적으로 가볍게 유지)
+
+- `.md` 파일만 동기화합니다 (이미지 등 첨부파일, `.canvas`는 대상 아님)
+- 파일 이름 변경은 "삭제 후 재생성"으로 처리됩니다
+- 릴레이 서버는 메모리에만 상태를 보관합니다. 서버가 재시작되면, 방에 다시
+  접속하는 첫 클라이언트의 로컬 vault 내용으로 다시 채워집니다
+- 연결 해제 후 재연결한 경우, 이미 열려 있던 노트는 다시 열어야 실시간 편집이
+  바로 재적용됩니다 (연결 자체는 정상적으로 재수립됩니다)
