@@ -1,7 +1,7 @@
 {
   "id": "liveedit",
   "name": "LiveEdit",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "minAppVersion": "1.4.0",
   "description": "Real-time collaborative note editing with your team over your own network — Notion-style, host/member roles, no cloud.",
   "author": "",

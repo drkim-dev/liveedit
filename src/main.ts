@@ -1,4 +1,4 @@
-import { Notice, Plugin } from "obsidian";
+import { MarkdownView, Notice, Plugin } from "obsidian";
 import { buildHealthUrl, buildRoomUrl, LiveEditConnection } from "./connection";
 import { createLiveEditExtension, ActiveSession } from "./editor-binding";
 import { FileSync } from "./file-sync";
@@ -15,6 +15,12 @@ export default class LiveEditPlugin extends Plugin {
   // object literal on every getSession() call (that caused a full yCollab
   // rebind on every keystroke, which is what was causing the lag).
   private session: ActiveSession | null = null;
+  // True only once fileSync.start() has fully finished seeding/pulling the
+  // room. Editors must not bind (and possibly create) a shared Y.Text before
+  // this — otherwise a file opened right as we connect can race the initial
+  // sync and end up bound to an orphaned Y.Text that the room's map never
+  // ends up pointing at (looks like "cursors sync, text doesn't").
+  private ready = false;
   private statusBar!: StatusBarWidget;
   private unsubscribeStatus: (() => void) | null = null;
   private awarenessChangeHandler: (() => void) | null = null;
@@ -68,7 +74,7 @@ export default class LiveEditPlugin extends Plugin {
   }
 
   private getSession(): ActiveSession | null {
-    if (!this.connection || this.connection.status !== "connected") return null;
+    if (!this.ready || !this.connection || this.connection.status !== "connected") return null;
     return this.session;
   }
 
@@ -117,10 +123,31 @@ export default class LiveEditPlugin extends Plugin {
     // doc from a stale local copy while the room's real content is in flight.
     await connection.waitUntilSynced();
     await fileSync.start();
+    // Only now is it safe for editors to bind to shared Y.Text instances.
+    if (this.connection === connection) {
+      this.ready = true;
+      this.nudgeOpenEditors();
+    }
+  }
+
+  /**
+   * Forces every open markdown editor to run a CM6 update cycle (via a public,
+   * no-op Editor API call) so our editor-binding extension re-checks getSession()
+   * right away, instead of waiting for the user's next keystroke/click.
+   */
+  private nudgeOpenEditors(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (view instanceof MarkdownView) {
+        const pos = view.editor.getCursor();
+        view.editor.setCursor(pos);
+      }
+    }
   }
 
   disconnect(): void {
     if (!this.connection) return;
+    this.ready = false;
     this.unsubscribeStatus?.();
     this.unsubscribeStatus = null;
     if (this.awarenessChangeHandler) {
