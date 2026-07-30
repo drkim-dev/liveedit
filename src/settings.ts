@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type LiveEditPlugin from "./main";
 
 export type Role = "host" | "member";
@@ -32,6 +32,22 @@ export const DEFAULT_SETTINGS: LiveEditSettings = {
 export class LiveEditSettingTab extends PluginSettingTab {
   constructor(app: App, private plugin: LiveEditPlugin) {
     super(app, plugin);
+  }
+
+  /**
+   * Server address / room code only take effect on the next connect() — an
+   * already-open session keeps using whatever it connected with. Silently
+   * continuing on the old room after the user thinks they changed it is
+   * exactly how two people can end up "in the same room" without noticing.
+   * So: force a disconnect immediately and make that unmissable.
+   */
+  private disconnectIfLive(fieldLabel: string): void {
+    if (!this.plugin.isConnected()) return;
+    this.plugin.disconnect();
+    new Notice(
+      `LiveEdit: ${fieldLabel}가 변경되어 연결을 끊었습니다. 확인 후 '세션 연결'로 다시 접속해주세요.`,
+      8000,
+    );
   }
 
   display(): void {
@@ -76,6 +92,7 @@ export class LiveEditSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.serverUrl = value.trim();
             await this.plugin.saveSettings();
+            this.disconnectIfLive("서버 주소");
           }),
       );
     if (isHost) {
@@ -100,6 +117,7 @@ export class LiveEditSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.room = value.trim() || DEFAULT_SETTINGS.room;
             await this.plugin.saveSettings();
+            this.disconnectIfLive("방 코드");
           }),
       );
 

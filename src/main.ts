@@ -77,6 +77,10 @@ export default class LiveEditPlugin extends Plugin {
     this.disconnect();
   }
 
+  isConnected(): boolean {
+    return this.connection !== null;
+  }
+
   private getSession(): ActiveSession | null {
     if (!this.ready || !this.connection || this.connection.status !== "connected") return null;
     return this.session;

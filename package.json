@@ -1,6 +1,6 @@
 {
   "name": "liveedit",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Same-network real-time collaborative note editing for Obsidian, Notion-style.",
   "main": "main.js",
   "private": true,
