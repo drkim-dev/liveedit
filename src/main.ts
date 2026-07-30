@@ -1,5 +1,5 @@
 import { Notice, Plugin } from "obsidian";
-import { buildRoomUrl, LiveEditConnection } from "./connection";
+import { buildHealthUrl, buildRoomUrl, LiveEditConnection } from "./connection";
 import { createLiveEditExtension, ActiveSession } from "./editor-binding";
 import { FileSync } from "./file-sync";
 import { ParticipantsModal, StatusBarWidget } from "./presence";
@@ -25,6 +25,7 @@ export default class LiveEditPlugin extends Plugin {
     const statusBarEl = this.addStatusBarItem();
     statusBarEl.style.cursor = "pointer";
     this.statusBar = new StatusBarWidget(statusBarEl);
+    this.statusBar.render("disconnected", 0, this.settings.role);
     this.registerDomEvent(statusBarEl, "click", () => this.showParticipants());
 
     this.addSettingTab(new LiveEditSettingTab(this.app, this));
@@ -49,6 +50,11 @@ export default class LiveEditPlugin extends Plugin {
       id: "show-participants",
       name: "참여자 보기",
       callback: () => this.showParticipants(),
+    });
+    this.addCommand({
+      id: "check-server",
+      name: "서버 상태 확인 (방장용)",
+      callback: () => this.checkServerHealth(),
     });
 
     if (this.settings.autoReconnect) {
@@ -98,7 +104,7 @@ export default class LiveEditPlugin extends Plugin {
 
     const refreshStatusBar = (): void => {
       const remoteCount = connection.awareness.getStates().size - 1;
-      this.statusBar.render(connection.status, Math.max(0, remoteCount));
+      this.statusBar.render(connection.status, Math.max(0, remoteCount), this.settings.role);
     };
 
     this.awarenessChangeHandler = refreshStatusBar;
@@ -126,7 +132,29 @@ export default class LiveEditPlugin extends Plugin {
     this.fileSync?.destroy();
     this.fileSync = null;
     this.session = null;
-    this.statusBar.render("disconnected", 0);
+    this.statusBar.render("disconnected", 0, this.settings.role);
+  }
+
+  async checkServerHealth(): Promise<void> {
+    let url: string;
+    try {
+      url = buildHealthUrl(this.settings.serverUrl);
+    } catch {
+      new Notice("LiveEdit: 서버 주소가 올바르지 않습니다.");
+      return;
+    }
+
+    new Notice(`LiveEdit: ${url} 확인 중…`);
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as { ok: boolean; rooms: number };
+      new Notice(`LiveEdit: 서버 정상 동작 중 (열린 방 ${data.rooms}개)`);
+    } catch (error) {
+      new Notice(
+        `LiveEdit: 서버에 연결할 수 없습니다. 릴레이 서버(node dist/server.js)가 켜져 있는지 확인하세요.\n(${String(error)})`,
+      );
+    }
   }
 
   showParticipants(): void {

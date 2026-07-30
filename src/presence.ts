@@ -82,14 +82,15 @@ const STATUS_ICON: Record<ConnectionStatus, string> = {
 export class StatusBarWidget {
   constructor(private readonly el: HTMLElement) {
     this.el.addClass("liveedit-status");
-    this.render("disconnected", 0);
+    this.render("disconnected", 0, "member");
   }
 
-  render(status: ConnectionStatus, remoteCount: number): void {
+  render(status: ConnectionStatus, remoteCount: number, role: "host" | "member"): void {
+    const roleTag = role === "host" ? "방장" : "참여자";
     this.el.setText(
       status === "connected"
-        ? `${STATUS_ICON[status]} LiveEdit · ${remoteCount + 1}명`
-        : `${STATUS_ICON[status]} LiveEdit ${STATUS_LABEL[status]}`,
+        ? `${STATUS_ICON[status]} LiveEdit(${roleTag}) · ${remoteCount + 1}명`
+        : `${STATUS_ICON[status]} LiveEdit(${roleTag}) ${STATUS_LABEL[status]}`,
     );
   }
 }

@@ -1,7 +1,10 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type LiveEditPlugin from "./main";
 
+export type Role = "host" | "member";
+
 export interface LiveEditSettings {
+  role: Role;
   serverUrl: string;
   room: string;
   displayName: string;
@@ -17,6 +20,7 @@ export function randomColor(): string {
 }
 
 export const DEFAULT_SETTINGS: LiveEditSettings = {
+  role: "member",
   serverUrl: "ws://localhost:1234",
   room: "team",
   displayName: "",
@@ -33,25 +37,62 @@ export class LiveEditSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    const isHost = this.plugin.settings.role === "host";
+
+    containerEl.createEl("h3", { text: "역할" });
+
+    new Setting(containerEl)
+      .setName("이 PC의 역할")
+      .setDesc(
+        isHost
+          ? "방장: server/ 폴더의 릴레이 서버를 이 PC(또는 팀 상시 서버)에서 계속 켜두고, Obsidian도 함께 켜둔 상태로 팀원과 같이 편집합니다."
+          : "참여자: 방장이 켜둔 릴레이 서버 주소로 접속만 하면 됩니다. 별도로 서버를 실행할 필요가 없습니다.",
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("member", "참여자")
+          .addOption("host", "방장 (릴레이 서버 운영)")
+          .setValue(this.plugin.settings.role)
+          .onChange(async (value) => {
+            this.plugin.settings.role = value as Role;
+            await this.plugin.saveSettings();
+            this.display(); // redraw — labels/hints below depend on the role
+          }),
+      );
 
     containerEl.createEl("h3", { text: "연결" });
 
-    new Setting(containerEl)
+    const serverSetting = new Setting(containerEl)
       .setName("릴레이 서버 주소")
-      .setDesc("팀에서 운영 중인 LiveEdit 릴레이 서버 주소 (예: ws://192.168.0.10:1234)")
+      .setDesc(
+        isHost
+          ? "이 PC에서 실행 중인 서버 주소. 보통 ws://localhost:포트. 팀원에게는 이 PC의 사설망 IP(예: ws://192.168.0.10:포트)를 알려주세요."
+          : "방장에게 전달받은 서버 주소를 입력하세요 (예: ws://192.168.0.10:1234)",
+      )
       .addText((text) =>
         text
-          .setPlaceholder("ws://192.168.0.10:1234")
+          .setPlaceholder(isHost ? "ws://localhost:1234" : "ws://192.168.0.10:1234")
           .setValue(this.plugin.settings.serverUrl)
           .onChange(async (value) => {
             this.plugin.settings.serverUrl = value.trim();
             await this.plugin.saveSettings();
           }),
       );
+    if (isHost) {
+      serverSetting.addButton((button) =>
+        button
+          .setButtonText("서버 상태 확인")
+          .onClick(() => this.plugin.checkServerHealth()),
+      );
+    }
 
     new Setting(containerEl)
       .setName("방 코드")
-      .setDesc("같은 코드를 쓰는 사람끼리만 같은 문서를 공유합니다.")
+      .setDesc(
+        isHost
+          ? "팀원에게 서버 주소와 함께 알려줄 코드. 같은 코드를 쓰는 사람끼리만 같은 문서를 공유합니다."
+          : "같은 코드를 쓰는 사람끼리만 같은 문서를 공유합니다. 방장에게 확인하세요.",
+      )
       .addText((text) =>
         text
           .setPlaceholder("team")
@@ -64,7 +105,7 @@ export class LiveEditSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("자동 재연결")
-      .setDesc("연결이 끊기면 자동으로 재시도합니다.")
+      .setDesc("연결이 끊기면 자동으로 재시도하고, Obsidian을 켤 때 자동으로 접속합니다.")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.autoReconnect).onChange(async (value) => {
           this.plugin.settings.autoReconnect = value;

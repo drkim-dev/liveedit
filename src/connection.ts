@@ -20,6 +20,15 @@ export function buildRoomUrl(serverUrl: string, room: string): string {
   return url.toString();
 }
 
+/** Builds the relay server's health-check URL (ws(s):// -> http(s)://, path -> /healthz). */
+export function buildHealthUrl(serverUrl: string): string {
+  const url = new URL(serverUrl);
+  url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+  url.pathname = "/healthz";
+  url.search = "";
+  return url.toString();
+}
+
 /**
  * Thin Yjs WebSocket peer: only the sync + awareness wire protocols, no
  * IndexedDB persistence or cross-tab sync — those aren't needed here.

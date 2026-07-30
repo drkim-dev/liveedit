@@ -26,7 +26,11 @@ function toUint8Array(data: WebSocket.RawData): Uint8Array {
 
 const httpServer = createServer((req, res) => {
   if (req.url === "/healthz") {
-    res.writeHead(200, { "content-type": "application/json" });
+    // Allow the Obsidian plugin (running from an app:// origin) to fetch() this directly.
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "access-control-allow-origin": "*",
+    });
     res.end(JSON.stringify({ ok: true, rooms: rooms.size }));
     return;
   }
