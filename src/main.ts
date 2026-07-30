@@ -10,6 +10,11 @@ export default class LiveEditPlugin extends Plugin {
 
   private connection: LiveEditConnection | null = null;
   private fileSync: FileSync | null = null;
+  // Stable object reference for the lifetime of one connect() call — editor-binding.ts
+  // compares this by identity to decide whether to rebind, so it must NOT be a fresh
+  // object literal on every getSession() call (that caused a full yCollab
+  // rebind on every keystroke, which is what was causing the lag).
+  private session: ActiveSession | null = null;
   private statusBar!: StatusBarWidget;
   private unsubscribeStatus: (() => void) | null = null;
   private awarenessChangeHandler: (() => void) | null = null;
@@ -57,8 +62,8 @@ export default class LiveEditPlugin extends Plugin {
   }
 
   private getSession(): ActiveSession | null {
-    if (!this.connection || !this.fileSync || this.connection.status !== "connected") return null;
-    return { awareness: this.connection.awareness, fileSync: this.fileSync };
+    if (!this.connection || this.connection.status !== "connected") return null;
+    return this.session;
   }
 
   async connect(): Promise<void> {
@@ -89,6 +94,7 @@ export default class LiveEditPlugin extends Plugin {
 
     this.connection = connection;
     this.fileSync = fileSync;
+    this.session = { awareness: connection.awareness, fileSync };
 
     const refreshStatusBar = (): void => {
       const remoteCount = connection.awareness.getStates().size - 1;
@@ -119,6 +125,7 @@ export default class LiveEditPlugin extends Plugin {
     this.connection = null;
     this.fileSync?.destroy();
     this.fileSync = null;
+    this.session = null;
     this.statusBar.render("disconnected", 0);
   }
 
