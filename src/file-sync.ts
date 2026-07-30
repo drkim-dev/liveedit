@@ -33,6 +33,11 @@ export class FileSync {
     return path === folder || path.startsWith(`${folder}/`);
   }
 
+  /** Whether `path` already has shared content — i.e. someone already opened/synced it. */
+  hasText(path: string): boolean {
+    return this.files.has(path);
+  }
+
   getOrCreateText(path: string): Y.Text {
     let text = this.files.get(path);
     if (!text) {

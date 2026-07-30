@@ -7,6 +7,7 @@ import type { Awareness } from "y-protocols/awareness";
 
 export interface FileSyncLike {
   isTracked(path: string): boolean;
+  hasText(path: string): boolean;
   getOrCreateText(path: string): Y.Text;
   markOpen(path: string): void;
   markClosed(path: string): void;
@@ -83,7 +84,26 @@ export function createLiveEditExtension(deps: EditorBindingDeps): Extension {
 
           session.fileSync.markOpen(path);
           this.boundPath = path;
+
+          const alreadyShared = session.fileSync.hasText(path);
           const ytext = session.fileSync.getOrCreateText(path);
+
+          if (alreadyShared) {
+            // The shared doc is authoritative — the editor's current buffer may be a
+            // stale snapshot from before this file was last synced (e.g. the user
+            // navigated away and back while someone else kept editing it), so force
+            // it to match before wiring up live collaboration.
+            const sharedContent = ytext.toString();
+            if (view.state.doc.toString() !== sharedContent) {
+              view.dispatch({
+                changes: { from: 0, to: view.state.doc.length, insert: sharedContent },
+              });
+            }
+          } else if (view.state.doc.length > 0) {
+            // Brand new shared doc — seed it from whatever's already in the editor.
+            ytext.insert(0, view.state.doc.toString());
+          }
+
           view.dispatch({
             effects: collabCompartment.reconfigure(yCollab(ytext, session.awareness)),
           });
