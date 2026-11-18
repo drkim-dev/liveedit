@@ -43,3 +43,18 @@
 .liveedit-note-link { height: auto; padding: 0; border: none; background: none; box-shadow: none; color: var(--text-accent); text-align: left; white-space: normal; overflow-wrap: anywhere; }
 .liveedit-note-link:hover { text-decoration: underline; }
 .liveedit-color-dot { flex-shrink: 0; }
+
+/* Keep the native filename and its drag/rename target intact. */
+.nav-file-title > .liveedit-file-presence {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-inline-start: auto;
+  padding-inline-start: 6px;
+  max-width: 55%;
+  flex-shrink: 1;
+  overflow: hidden;
+  font-size: var(--font-smallest);
+  user-select: none;
+}
+.liveedit-file-person { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

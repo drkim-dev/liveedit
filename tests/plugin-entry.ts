@@ -5,3 +5,5 @@ export { VaultGuard } from "../src/vault-guard";
 
 export { getParticipants, ParticipantsModal, ParticipantsView } from "../src/presence";
 export { validDisplayName } from "../src/settings";
+
+export { FileExplorerPresence } from "../src/explorer-presence";

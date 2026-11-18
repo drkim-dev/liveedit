@@ -1,6 +1,7 @@
 import { MarkdownView, Notice, Plugin } from "obsidian";
 import { buildHealthUrl, buildRoomUrl, ConnectionStatus, LiveEditConnection } from "./connection";
 import { createLiveEditExtension, ActiveSession } from "./editor-binding";
+import { FileExplorerPresence } from "./explorer-presence";
 import { FileSync } from "./file-sync";
 import { ParticipantsModal, ParticipantsView, PARTICIPANTS_VIEW, StatusBarWidget } from "./presence";
 import { DEFAULT_SETTINGS, LiveEditSettings, LiveEditSettingTab, validDisplayName } from "./settings";
@@ -11,6 +12,7 @@ export default class LiveEditPlugin extends Plugin {
   settings!: LiveEditSettings;
 
   private connection: LiveEditConnection | null = null;
+  private explorerPresence: FileExplorerPresence | null = null;
   private fileSync: FileSync | null = null;
   // Stable object reference for the lifetime of one connect() call — editor-binding.ts
   // compares this by identity to decide whether to rebind, so it must NOT be a fresh
@@ -108,7 +110,8 @@ export default class LiveEditPlugin extends Plugin {
 
     this.addSettingTab(new LiveEditSettingTab(this.app, this));
     this.registerView(PARTICIPANTS_VIEW, (leaf) => new ParticipantsView(leaf, this));
-    this.addRibbonIcon("users", "LiveEdit 참여 위치", () => { void this.showParticipantsSidebar(); });
+    this.addRibbonIcon("users", "LiveEdit 참여자", () => this.showParticipants());
+    this.explorerPresence = new FileExplorerPresence(this.app, this);
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.updateActiveNote()));
     this.registerEvent(this.app.workspace.on("file-open", () => this.updateActiveNote()));
     this.registerEvent(this.app.vault.on("rename", () => this.updateActiveNote()));
@@ -156,6 +159,8 @@ export default class LiveEditPlugin extends Plugin {
   }
 
   onunload(): void {
+    this.explorerPresence?.destroy();
+    this.explorerPresence = null;
     this.disconnect();
     this.vaultGuard?.destroy();
     this.vaultGuard = null;
@@ -270,7 +275,7 @@ export default class LiveEditPlugin extends Plugin {
       this.ready = true;
       this.hasBeenReady = true;
       this.updateActiveNote();
-      void this.showParticipantsSidebar(false);
+
       this.nudgeOpenEditors();
       refreshStatusBar();
     };

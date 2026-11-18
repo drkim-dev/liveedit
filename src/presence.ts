@@ -74,7 +74,7 @@ function renderParticipants(app: App, el: HTMLElement, source: PresenceSource): 
           eState: participant.line ? { line: participant.line - 1 } : undefined,
         });
       };
-      detail.createSpan({ text: ` · ${participant.line ? `${participant.line}행 · ` : ""}${participant.editing ? "작성 중" : "보고 있음"}` });
+      detail.createSpan({ text: participant.line ? ` · ${participant.line}행` : "" });
     } else detail.setText("노트를 선택하지 않음");
     if (state?.host && !participant.host && participant.peerId) {
       const kick = row.createEl("button", { text: "퇴장" });
@@ -90,7 +90,7 @@ function participantRenderer(app: App, el: HTMLElement, source: PresenceSource):
     const connection = source.getPresenceConnection();
     const signature = JSON.stringify([
       source.getConnectionStatus(), connection?.roomState?.host, connection?.roomState?.locked,
-      connection?.status === "connected" ? getParticipants(connection.awareness, connection.doc.clientID, connection) : null,
+      connection?.status === "connected" ? getParticipants(connection.awareness, connection.doc.clientID, connection).map(({ editing, ...person }) => person) : null,
     ]);
     if (signature === previous) return;
     previous = signature;
