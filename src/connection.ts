@@ -10,6 +10,7 @@ const MSG_AWARENESS = 1;
 const MSG_CONTROL = 2;
 export interface RoomState {
   protocol: number;
+  lifecycle?: number;
   host: boolean;
   locked: boolean;
   peers: { id: string; host: boolean; clientIds: number[] }[];
@@ -230,7 +231,7 @@ export class LiveEditConnection {
       this.watchdog = null;
       this.synced = false;
       this.roomState = null;
-      this.lastError = event.reason || `연결 종료 (${event.code})`;
+      this.lastError = event.reason || `서버 연결 실패 (${event.code}). 방장은 서버가 켜져 있는지 확인해주세요.`;
       if ([4001, 4003, 4004, 4005].includes(event.code)) this.shouldReconnect = false;
       this.setStatus("disconnected");
       this.clearRemoteAwareness();

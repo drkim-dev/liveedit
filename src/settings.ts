@@ -67,13 +67,13 @@ export class LiveEditSettingTab extends PluginSettingTab {
       .setName("이 PC의 역할")
       .setDesc(
         isHost
-          ? "방장: 서버 인증 키로 접속해 참여자 퇴장과 신규 입장 잠금을 관리합니다. 새 방의 초기 문서는 방장의 공유 폴더에서 가져옵니다."
+          ? "이 PC에서 서버를 실행하고 아래 방 개설하기를 누르면 시작합니다. 현재 볼트의 노트를 공유합니다."
           : "참여자: 방장이 켜둔 릴레이 서버 주소로 접속만 하면 됩니다. 별도로 서버를 실행할 필요가 없습니다.",
       )
       .addDropdown((dropdown) =>
         dropdown
           .addOption("member", "참여자")
-          .addOption("host", "방장 (릴레이 서버 운영)")
+          .addOption("host", "방장")
           .setValue(this.plugin.settings.role)
           .onChange(async (value) => {
             this.plugin.settings.role = value as Role;
@@ -87,16 +87,19 @@ export class LiveEditSettingTab extends PluginSettingTab {
 
     let connectButton: ButtonComponent;
     let disconnectButton: ButtonComponent;
+    let connectionSetting: Setting;
+    const connectionDescription = "이 볼트의 노트를 함께 편집합니다. 최신 동기화가 끝나면 편집할 수 있습니다.";
     const updateButtons = (): void => {
       const status = this.plugin.getConnectionStatus();
+      connectionSetting?.setDesc(this.plugin.getConnectionMessage?.() || connectionDescription);
       if (status === "connected") this.everConnected = true;
-      connectButton.setButtonText(status === "connected" ? "재접속" : status === "syncing" ? "최신 문서 받는 중…" : status === "connecting" ? "연결 중…" : this.everConnected || this.plugin.isConnected() ? "재접속" : "접속");
-      connectButton.setDisabled(status === "connecting" || status === "syncing");
+      connectButton.setButtonText(status === "syncing" ? "최신 문서 받는 중…" : status === "connecting" ? (isHost ? "방 여는 중…" : "연결 중…") : isHost ? (status === "connected" ? "방 열림" : "방 개설하기") : this.everConnected || this.plugin.isConnected() ? "재접속" : "참여하기");
+      connectButton.setDisabled(status === "connecting" || status === "syncing" || (isHost && status === "connected"));
       disconnectButton.setDisabled(!this.plugin.isConnected());
     };
-    new Setting(containerEl)
-      .setName("세션 접속")
-      .setDesc("이 볼트의 노트를 함께 편집합니다. 연결 및 최신 동기화 완료 전에는 읽기 전용입니다. 개인 노트는 다른 볼트를 사용하세요.")
+    connectionSetting = new Setting(containerEl)
+      .setName(isHost ? "방 개설" : "방 참여")
+      .setDesc(connectionDescription)
       .addButton((button) => {
         connectButton = button;
         button.setCta().onClick(async () => {
@@ -106,24 +109,10 @@ export class LiveEditSettingTab extends PluginSettingTab {
       })
       .addButton((button) => {
         disconnectButton = button;
-        button.setButtonText("연결 해제").onClick(() => this.plugin.disconnect());
+        button.setButtonText(isHost ? "방 닫기" : "연결 해제").onClick(() => this.plugin.disconnect());
       });
     updateButtons();
     this.unsubscribeConnection = this.plugin.onConnectionChange(updateButtons);
-
-    if (isHost) {
-      new Setting(containerEl)
-        .setName("방장 인증 키")
-        .setDesc("서버의 LIVEEDIT_HOST_TOKEN과 같은 값. 참여자에게 공유하지 마세요. 이 기기의 플러그인 설정에 저장됩니다.")
-        .addText((text) => {
-          text.inputEl.type = "password";
-          text.setValue(this.plugin.settings.hostToken).onChange(async (value) => {
-            this.plugin.settings.hostToken = value;
-            await this.plugin.saveSettings();
-            this.disconnectIfLive("방장 인증 키");
-          });
-        });
-    }
 
     const serverSetting = new Setting(containerEl)
       .setName("릴레이 서버 주소")
@@ -151,26 +140,8 @@ export class LiveEditSettingTab extends PluginSettingTab {
     }
 
     new Setting(containerEl)
-      .setName("방 코드")
-      .setDesc(
-        isHost
-          ? "팀원에게 서버 주소와 함께 알려줄 코드. 같은 코드를 쓰는 사람끼리만 같은 문서를 공유합니다."
-          : "같은 코드를 쓰는 사람끼리만 같은 문서를 공유합니다. 방장에게 확인하세요.",
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder("team")
-          .setValue(this.plugin.settings.room)
-          .onChange(async (value) => {
-            this.plugin.settings.room = value.trim() || DEFAULT_SETTINGS.room;
-            await this.plugin.saveSettings();
-            this.disconnectIfLive("방 코드");
-          }),
-      );
-
-    new Setting(containerEl)
       .setName("자동 재연결")
-      .setDesc("연결이 끊기면 자동으로 재시도하고, Obsidian을 켤 때 자동으로 접속합니다.")
+      .setDesc("연결이 끊기면 다시 접속합니다. 방장은 Obsidian 시작 후 방 개설하기를 직접 눌러야 합니다.")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.autoReconnect).onChange(async (value) => {
           this.plugin.settings.autoReconnect = value;
