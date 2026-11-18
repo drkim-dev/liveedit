@@ -12,7 +12,7 @@ const require = createRequire(import.meta.url);
 const Y = require("yjs");
 const { createLiveEditExtension, editorInfoField, setEditorFile, EditorState, EditorView, Awareness } = require("./generated/editor.cjs");
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
-function setup(doc = new Y.Doc(), access = null) {
+function setup(doc = new Y.Doc(), access = null, onActivity = undefined) {
   const files = doc.getMap("files");
   if (files.size === 0) {
     files.set("A.md", new Y.Text("alpha"));
@@ -32,6 +32,7 @@ function setup(doc = new Y.Doc(), access = null) {
   const session = { awareness, fileSync };
   const view = new EditorView({ state: EditorState.create({ doc: "alpha", extensions: [editorInfoField, createLiveEditExtension({
     getSession: () => access?.locked ? null : session,
+    onActivity,
     isReadOnlyPath: (path) => !!access?.locked && ["A.md", "B.md"].includes(path),
     onAccessChange: access ? (callback) => { access.listeners.add(callback); return () => access.listeners.delete(callback); } : undefined,
   })] }), parent: document.body });
@@ -150,4 +151,20 @@ test("three participants keep both notes consistent across switches and edits", 
     first.view.dispatch({ changes: { from: 0, to: first.view.state.doc.length, insert: "orphan buffer" } });
     for (const env of envs) assert.equal(env.files.has("B.md"), false, "a deleted note must not be recreated by its open editor");
   } finally { for (const env of envs) env.close(); }
+});
+
+
+test("presence marks local typing as editing and remote document updates as viewing", async () => {
+  const activities = [];
+  const env = setup(new Y.Doc(), null, (...args) => activities.push(args));
+  try {
+    await tick(); env.view.focus(); await tick();
+    env.view.dispatch({ changes: { from: 5, insert: "\nlocal" }, userEvent: "input.type", selection: { anchor: 11 } });
+    assert.deepEqual(activities.at(-1), ["A.md", 2, true]);
+    activities.length = 0;
+    env.files.get("A.md").insert(0, "remote ");
+    await tick();
+    assert.ok(activities.length > 0);
+    assert.equal(activities.some((activity) => activity[2]), false, "remote updates must not impersonate local typing");
+  } finally { env.close(); }
 });

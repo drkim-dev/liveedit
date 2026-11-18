@@ -37,3 +37,9 @@
   border-radius: 3px;
   padding: 1px 4px !important;
 }
+
+.liveedit-participant { flex-wrap: wrap; padding: 8px 0; border-bottom: 1px solid var(--background-modifier-border); }
+.liveedit-participant-location { flex-basis: 100%; color: var(--text-muted); font-size: var(--font-smallest); overflow-wrap: anywhere; }
+.liveedit-note-link { height: auto; padding: 0; border: none; background: none; box-shadow: none; color: var(--text-accent); text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.liveedit-note-link:hover { text-decoration: underline; }
+.liveedit-color-dot { flex-shrink: 0; }

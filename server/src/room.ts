@@ -20,7 +20,7 @@ export class Room {
   readonly doc = new Y.Doc();
   readonly awareness = new awarenessProtocol.Awareness(this.doc);
   private readonly peers = new Map<WebSocket, Set<number>>();
-  private readonly identities = new Map<WebSocket, { id: string; host: boolean }>();
+  private readonly identities = new Map<WebSocket, { id: string; host: boolean; name: string; color: string; clientId: number }>();
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private emptyTimer: ReturnType<typeof setTimeout> | null = null;
   private locked = false;
@@ -72,7 +72,6 @@ export class Room {
           awarenessProtocol.encodeAwarenessUpdate(this.awareness, changedIds),
         );
         this.broadcast(encoding.toUint8Array(encoder), originWs);
-        this.sendRoomState();
       },
     );
   }
@@ -84,7 +83,7 @@ export class Room {
   private get hostPresent(): boolean { return Array.from(this.identities.values()).some((peer) => peer.host); }
 
   /** Register a new peer and send it the current doc + presence snapshot. */
-  join(ws: WebSocket, host = false): void {
+  join(ws: WebSocket, host = false, name = "", clientId = 0): void {
     if (!host && (!this.hostPresent || this.doc.getMap("liveedit").get("initialized") !== true)) {
       ws.close(4006, "방장이 먼저 방 개설하기를 눌러야 합니다");
       return;
@@ -96,7 +95,13 @@ export class Room {
     if (this.emptyTimer) clearTimeout(this.emptyTimer);
     this.emptyTimer = null;
     this.peers.set(ws, new Set());
-    this.identities.set(ws, { id: randomUUID(), host });
+    if (Array.from(this.identities.values()).some((peer) => peer.clientId === clientId)) {
+      this.peers.delete(ws);
+      ws.close(4009, "접속 식별자가 중복되었습니다. 다시 접속해주세요");
+      return;
+    }
+    const used = new Set(Array.from(this.identities.values(), (peer) => peer.color));
+    this.identities.set(ws, { id: randomUUID(), host, name, clientId, color: allocateColor(used) });
     this.sendRoomState();
 
     const syncEncoder = encoding.createEncoder();
@@ -158,11 +163,29 @@ export class Room {
         ws.send(encoding.toUint8Array(encoder));
       }
     } else if (type === MSG_AWARENESS) {
-      awarenessProtocol.applyAwarenessUpdate(
-        this.awareness,
-        decoding.readVarUint8Array(decoder),
-        ws,
-      );
+      const identity = this.identities.get(ws)!;
+      const payload = decoding.readVarUint8Array(decoder);
+      if (payload.length > 65536) throw new Error("Presence packet too large");
+      const update = decoding.createDecoder(payload);
+      if (decoding.readVarUint(update) !== 1) throw new Error("One presence identity per connection required");
+      const id = decoding.readVarUint(update);
+      const clock = decoding.readVarUint(update);
+      if (id !== identity.clientId) throw new Error("Presence identity mismatch");
+      const state = JSON.parse(decoding.readVarString(update));
+      if (state !== null) {
+        state.user = { name: identity.name, color: identity.color };
+        const file = state.viewingFile;
+        state.viewingFile = typeof file === "string" && file.length <= 1024 && file.endsWith(".md") &&
+          !file.split("/").some((part: string) => part.startsWith(".")) ? file : null;
+        state.line = Number.isSafeInteger(state.line) && state.line > 0 ? state.line : null;
+        state.editingUntil = typeof state.editingUntil === "number" ? Math.min(Date.now() + 5000, state.editingUntil) : 0;
+      }
+      const sanitized = encoding.createEncoder();
+      encoding.writeVarUint(sanitized, 1);
+      encoding.writeVarUint(sanitized, id);
+      encoding.writeVarUint(sanitized, clock);
+      encoding.writeVarString(sanitized, JSON.stringify(state));
+      awarenessProtocol.applyAwarenessUpdate(this.awareness, encoding.toUint8Array(sanitized), ws);
     } else if (type === 2) {
       if (!this.identities.get(ws)?.host) {
         ws.close(4001, "방장 권한이 필요합니다");
@@ -185,13 +208,13 @@ export class Room {
 
   private sendRoomState(): void {
     const peers = Array.from(this.identities, ([ws, identity]) => ({
-      ...identity, clientIds: Array.from(this.peers.get(ws) ?? []),
+      id: identity.id, host: identity.host, name: identity.name, color: identity.color, clientIds: [identity.clientId],
     }));
     for (const [ws, identity] of this.identities) {
       if (ws.readyState !== ws.OPEN) continue;
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, 2);
-      encoding.writeVarString(encoder, JSON.stringify({ protocol: 2, lifecycle: 1, host: identity.host, locked: this.locked, peers }));
+      encoding.writeVarString(encoder, JSON.stringify({ protocol: 2, lifecycle: 1, presence: 1, selfId: identity.id, host: identity.host, locked: this.locked, peers }));
       ws.send(encoding.toUint8Array(encoder));
     }
   }
@@ -221,4 +244,15 @@ export class Room {
       }
     }
   }
+}
+
+/** Allocate from a distinct palette first, then unique 24-bit colors for larger rooms. */
+export function allocateColor(used: Set<string>): string {
+  const palette = ["#e64980", "#1971c2", "#2b8a3e", "#e67700", "#7048e8", "#099268", "#c92a2a", "#a61e4d", "#5c7cfa", "#5c940d", "#0b7285", "#862e9c"];
+  for (const color of palette) if (!used.has(color)) return color;
+  for (let index = 1; index <= 0xffffff; index++) {
+    const color = "#" + ((index * 2654435761) & 0xffffff).toString(16).padStart(6, "0");
+    if (!used.has(color)) return color;
+  }
+  throw new Error("No color available");
 }
