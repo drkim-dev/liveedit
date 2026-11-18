@@ -45,7 +45,7 @@ test("settings connection button follows connect/reconnect/disconnect state", as
   const tab = new LiveEditSettingTab({}, plugin);
   tab.display();
   const [connect, disconnect] = Setting.buttons;
-  assert.equal(connect.text, "접속"); assert.equal(disconnect.disabled, true);
+  assert.equal(connect.text, "참여하기"); assert.equal(disconnect.disabled, true);
   const pending = connect.callback();
   assert.equal(connect.text, "연결 중…"); assert.equal(connect.disabled, true);
   await pending;
@@ -56,6 +56,51 @@ test("settings connection button follows connect/reconnect/disconnect state", as
   disconnect.callback();
   assert.equal(connect.text, "재접속"); assert.equal(disconnect.disabled, true);
   tab.hide(); assert.equal(listeners.size, 0);
+});
+
+test("host uses Open room and Close room with no room-code or host-key settings", async () => {
+  const listeners = new Set();
+  let status = "disconnected", opened = 0, active = false;
+  const notify = () => { for (const callback of listeners) callback(); };
+  const plugin = {
+    settings: { ...DEFAULT_SETTINGS, role: "host" },
+    getConnectionStatus: () => status, isConnected: () => active,
+    onConnectionChange: (callback) => { listeners.add(callback); return () => listeners.delete(callback); },
+    reconnect: async () => { opened++; active = true; status = "connected"; notify(); },
+    disconnect: () => { active = false; status = "disconnected"; notify(); },
+  };
+  Setting.buttons = []; Setting.names = [];
+  const settings = new LiveEditSettingTab({}, plugin); settings.display();
+  const [open, close] = Setting.buttons;
+  assert.equal(open.text, "방 개설하기"); assert.equal(opened, 0);
+  assert.equal(close.text, "방 닫기");
+  assert.equal(Setting.names.includes("방 코드"), false);
+  assert.equal(Setting.names.includes("방장 인증 키"), false);
+  await open.callback();
+  assert.equal(opened, 1); assert.equal(open.text, "방 열림"); assert.equal(open.disabled, true);
+  close.callback(); assert.equal(open.text, "방 개설하기");
+  settings.hide();
+});
+
+test("host plugin startup does not open a room automatically", async () => {
+  const fixture = memoryVault({}, PluginFile, PluginFolder);
+  const plugin = new LiveEditPlugin({ vault: fixture.vault, workspace: { getLeavesOfType: () => [] } });
+  plugin.loadData = async () => ({ ...DEFAULT_SETTINGS, role: "host", autoReconnect: true });
+  plugin.addStatusBarItem = () => ({ style: {}, addClass() {}, setText() {} });
+  for (const method of ["registerDomEvent", "addSettingTab", "registerEditorExtension", "addCommand"]) plugin[method] = () => {};
+  let opened = 0; plugin.connect = async () => { opened++; };
+  await plugin.onload();
+  assert.equal(opened, 0);
+  plugin.onunload();
+});
+
+test("keyless host access trusts only the actual server PC", async () => {
+  const { isServerPeer } = await import("../server/dist/host-auth.js");
+  assert.equal(isServerPeer("127.0.0.1"), true);
+  assert.equal(isServerPeer("::1"), true);
+  assert.equal(isServerPeer("::ffff:127.0.0.1"), true);
+  assert.equal(isServerPeer(undefined), false);
+  assert.equal(isServerPeer("198.51.100.42"), false);
 });
 
 test("vault guard locks shared writes, allows sync and private notes, and restores methods on unload", async () => {
@@ -368,10 +413,10 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
   let child;
   let address;
   let plugin;
-  async function start() {
+  async function start(legacyToken = false) {
     child = spawn(process.execPath, ["dist/server.js"], {
       cwd: new URL("../server/", import.meta.url),
-      env: { ...process.env, PORT: "0", LIVEEDIT_HOST_TOKEN: "host-secret", LIVEEDIT_TOKEN: "team-secret", LIVEEDIT_DATA_DIR: dataDir },
+      env: { ...process.env, PORT: "0", LIVEEDIT_HOST_TOKEN: "", LIVEEDIT_TOKEN: legacyToken ? "team-secret" : "", LIVEEDIT_DATA_DIR: dataDir },
       stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
     });
     let output = "";
@@ -381,7 +426,9 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     address = `ws://127.0.0.1:${output.match(/listening on :(\d+)/)[1]}/team?token=team-secret`;
   }
   function client(host = false, auto = false) {
-    const peer = new LiveEditConnection(address + (host ? "&hostToken=host-secret" : ""), auto, !host);
+    const connectionUrl = new URL(address);
+    if (host) { connectionUrl.searchParams.delete("token"); connectionUrl.searchParams.set("role", "host"); }
+    const peer = new LiveEditConnection(connectionUrl.toString(), auto, !host);
     peer.awareness.setLocalStateField("user", { name: host ? "Host" : "Member" });
     clients.push(peer);
     peer.connect();
@@ -394,9 +441,15 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
   }
   try {
     await start();
+    const notOpen = client(false);
+    await assert.rejects(notOpen.waitUntilSynced(), /방장이 먼저/);
     const host = client(true);
+    await host.waitUntilSynced();
+    const notReady = client(false);
+    await assert.rejects(notReady.waitUntilSynced(), /방장이 먼저/);
+    host.doc.getMap("liveedit").set("initialized", true);
     const member = client(false, true);
-    await Promise.all([host.waitUntilSynced(), member.waitUntilSynced()]);
+    await member.waitUntilSynced();
     assert.equal(host.roomState.host, true);
     assert.equal(member.roomState.host, false);
     const text = new Y.Text("initial");
@@ -525,10 +578,15 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     // Cross the first heartbeat: the client must reply without being disconnected.
     await pause(20500);
     assert.equal(host.status, "connected");
+    const liveMember = client(); await liveMember.waitUntilSynced();
+    host.disconnect();
+    await until(() => liveMember.status === "disconnected");
+    assert.match(liveMember.lastError, /방장이 방을 닫았/);
+    const waiting = client(); await assert.rejects(waiting.waitUntilSynced(), /방장이 먼저/);
     for (const peer of clients) peer.disconnect();
     await pause(100);
     await stop();
-    await start();
+    await start(true);
     const recovered = client(true);
     await recovered.waitUntilSynced();
     assert.equal(recovered.doc.getMap("files").get("Team/test.md").toString(), "fresh remote initial");
