@@ -13,6 +13,10 @@ const WRITE_DEBOUNCE_MS = 400;
 export class FileSync {
   private readonly files: Y.Map<Y.Text>;
   private readonly paths: Y.Map<string>;
+  // Keep deletion records so offline peers also remove folders on their next join.
+  private readonly folders: Y.Map<boolean>;
+  private readonly remoteFolders = new Map<string, number>();
+  private readonly deletingFolders = new Set<string>();
   private knownEntries = new Map<string, Y.Text>();
   private knownContent = new Map<string, string>();
   private readonly debounceTimers = new Map<string, number>();
@@ -37,6 +41,7 @@ export class FileSync {
   ) {
     this.files = doc.getMap<Y.Text>(FILES_KEY);
     this.paths = doc.getMap<string>("filePaths");
+    this.folders = doc.getMap<boolean>("folderStates");
     this.backupRoot = `.liveedit-backups/${Date.now()}-${doc.clientID}`;
   }
 
@@ -96,6 +101,7 @@ export class FileSync {
   async importLocalNotes(): Promise<void> { await this.seedFromVault(); }
 
   private addText(path: string, content: string): Y.Text {
+    this.recordParents(path);
     const id = this.files.has(path) ? `${this.files.doc!.clientID}:${Date.now()}:${++this.backupSequence}` : path;
     const text = new Y.Text(content);
     this.files.set(id, text);
@@ -148,6 +154,21 @@ export class FileSync {
     }
 
     if (this.destroyed) return;
+    // Import existing empty folders once when upgrading an older room.
+    if (this.canSeed && this.files.doc?.getMap("liveedit").get("foldersInitialized") !== true) {
+      this.files.doc?.transact(() => {
+        for (const folder of this.vault.getAllLoadedFiles?.() ?? []) {
+          if (!(folder instanceof TFolder) || !this.isTrackedFolder(folder.path)) continue;
+          if (Array.from(this.folders).some(([path, alive]) => alive === false &&
+            (folder.path === path || folder.path.startsWith(path + "/")))) continue;
+          this.folders.set(folder.path, true);
+        }
+        this.files.doc?.getMap("liveedit").set("foldersInitialized", true);
+      }, this);
+    }
+    await this.enqueueDisk(() => this.reconcileFolders(), true);
+
+    if (this.destroyed) return;
     if (this.canSeed) this.files.doc?.getMap("liveedit").set("initialized", true);
     this.vault.on("create", this.handleLocalCreate);
     this.vault.on("delete", this.handleLocalDelete);
@@ -189,11 +210,14 @@ export class FileSync {
     for (const path of this.entries().keys()) {
       await this.enqueueDisk(() => this.writeRemoteToVault(path, true), true);
     }
+    await this.enqueueDisk(() => this.reconcileFolders(), true);
   }
 
   private readonly handleTransaction = (transaction: Y.Transaction): void => {
     const changed = new Set<unknown>(transaction.changed.keys());
     const structure = changed.has(this.files) || changed.has(this.paths);
+    const folderStructure = changed.has(this.folders);
+    const folderMigration = changed.has(this.files.doc!.getMap("liveedit"));
     const current = structure ? this.entries() : this.knownEntries;
     if (structure) {
       const previous = this.knownEntries;
@@ -214,6 +238,7 @@ export class FileSync {
     }
     this.knownContent = new Map(Array.from(current, ([path, text]) => [path, text.toString()]));
     if (transaction.origin === this) return;
+    if (structure || folderStructure || folderMigration) void this.enqueueDisk(() => this.reconcileFolders());
     for (const [path, text] of current) {
       if (changed.has(text) && !this.openPaths.has(path)) this.scheduleWrite(path);
     }
@@ -251,7 +276,8 @@ export class FileSync {
   }
 
   private async writeRemoteToVault(path: string, backupLocal = false): Promise<void> {
-    if (this.destroyed || !this.isTracked(path) || this.openPaths.has(path)) return;
+    if (this.destroyed || !this.isTracked(path)) return;
+    if (this.openPaths.has(path) && this.vault.getAbstractFileByPath(path) instanceof TFile) return;
     const ytext = this.entry(path)?.[1];
     if (!ytext) return;
     const content = ytext.toString();
@@ -280,8 +306,11 @@ export class FileSync {
         }
       } else if (!existing) {
         await this.ensureParentFolder(path);
-        if (this.destroyed) return;
+        if (this.destroyed || this.entry(path)?.[1] !== ytext) return;
+        if (ytext.toString() !== content) { this.scheduleWrite(path); return; }
         await this.vault.create(path, content);
+        if (!this.hasText(path)) await this.deleteLocalFile(path);
+        else if (this.entry(path)?.[1] !== ytext || ytext.toString() !== content) this.scheduleWrite(path);
       }
     } finally {
       this.writingRemotely.delete(path);
@@ -291,12 +320,89 @@ export class FileSync {
   private async ensureParentFolder(path: string): Promise<void> {
     const folderPath = path.split("/").slice(0, -1).join("/");
     if (!folderPath) return;
+    await this.ensureFolder(folderPath);
+  }
+
+  private async ensureFolder(folderPath: string): Promise<void> {
     const existing = this.vault.getAbstractFileByPath(folderPath);
     if (!(existing instanceof TFolder)) {
+      const parts = folderPath.split("/");
+      const affected = parts.map((_, index) => parts.slice(0, index + 1).join("/"));
       try {
-        await this.vault.createFolder(folderPath);
+        await this.withRemoteFolders(affected, () => this.vault.createFolder(folderPath));
       } catch (error) {
         if (!(this.vault.getAbstractFileByPath(folderPath) instanceof TFolder)) throw error;
+      }
+    }
+  }
+
+  private async withRemoteFolders<T>(paths: string[], operation: () => Promise<T>): Promise<T> {
+    for (const path of paths) this.remoteFolders.set(path, (this.remoteFolders.get(path) ?? 0) + 1);
+    try { return await operation(); }
+    finally {
+      for (const path of paths) {
+        const count = (this.remoteFolders.get(path) ?? 1) - 1;
+        if (count) this.remoteFolders.set(path, count);
+        else this.remoteFolders.delete(path);
+      }
+    }
+  }
+
+  private isTrackedFolder(path: string): boolean { return this.isTracked(`${path}/folder-check.md`); }
+
+  private recordParents(path: string): void {
+    const parts = path.split("/");
+    for (let index = 1; index < parts.length; index++) {
+      const folder = parts.slice(0, index).join("/");
+      if (this.isTrackedFolder(folder) && this.folders.get(folder) !== true) this.folders.set(folder, true);
+    }
+  }
+
+  private async reconcileFolders(): Promise<void> {
+    if (this.destroyed) return;
+    const records = Array.from(this.folders).filter(([path, alive]) => this.isTrackedFolder(path) && typeof alive === "boolean");
+    for (const [path, alive] of records.sort(([a], [b]) => a.length - b.length)) {
+      if (this.destroyed) return;
+      if (alive && this.folders.get(path) === true) await this.ensureFolder(path);
+    }
+    for (const [path, alive] of records.sort(([a], [b]) => b.length - a.length)) {
+      if (this.destroyed) return;
+      if (!alive) await this.removeDeletedFolder(path, path);
+    }
+    if (this.files.doc?.getMap("liveedit").get("foldersInitialized") === true) {
+      // Remove empty leftovers from older clients/offline work only after the host
+      // has supplied a complete folder snapshot. Attachments and live descendants stay.
+      const local = (this.vault.getAllLoadedFiles?.() ?? []).filter((file): file is TFolder =>
+        file instanceof TFolder && this.isTrackedFolder(file.path));
+      for (const folder of local.sort((a, b) => b.path.length - a.path.length)) {
+        if (!this.folders.has(folder.path)) await this.removeDeletedFolder(folder.path, folder.path, true);
+      }
+    }
+  }
+
+  private async removeDeletedFolder(path: string, deletedRoot: string, allowUntracked = false): Promise<void> {
+    const removed = (): boolean => this.folders.get(deletedRoot) === false ||
+      (allowUntracked && !this.folders.has(deletedRoot));
+    if (this.destroyed || !removed() || this.folders.get(path) === true) return;
+    const folder = this.vault.getAbstractFileByPath(path);
+    if (!(folder instanceof TFolder)) return;
+    // Never recursively trash a folder containing an attachment, hidden file or concurrent new note.
+    for (const child of [...folder.children]) {
+      if (child instanceof TFolder && this.isTrackedFolder(child.path)) await this.removeDeletedFolder(child.path, deletedRoot, allowUntracked);
+    }
+    if (this.destroyed || !removed() || this.folders.get(path) === true || folder.children.length) return;
+    if (Array.from(this.entries().keys()).some((file) => file.startsWith(path + "/"))) return;
+    this.deletingFolders.add(path);
+    try { await this.withRemoteFolders([path], () => this.vault.trash(folder, true)); }
+    finally { this.deletingFolders.delete(path); }
+    // A new update may arrive while the filesystem is trashing the old folder.
+    // Its delete events must not remove that new shared entry; restore it afterwards.
+    for (const file of this.entries().keys()) {
+      if (file.startsWith(path + "/")) await this.writeRemoteToVault(file);
+    }
+    for (const [destination, alive] of this.folders) {
+      if (alive === true && this.isTrackedFolder(destination) && (destination === path || destination.startsWith(path + "/"))) {
+        await this.ensureFolder(destination);
       }
     }
   }
@@ -316,6 +422,11 @@ export class FileSync {
 
   private readonly handleLocalCreate = async (file: TAbstractFile): Promise<void> => {
     if (this.destroyed || !this.canPublish()) return;
+    if (file instanceof TFolder) {
+      if (this.remoteFolders.has(file.path) || !this.isTrackedFolder(file.path)) return;
+      this.files.doc?.transact(() => this.recordParents(`${file.path}/folder-check.md`), this);
+      return;
+    }
     if (!(file instanceof TFile) || !this.isTracked(file.path)) return;
     if (this.writingRemotely.has(file.path) || this.hasText(file.path)) return;
     const content = await this.vault.read(file);
@@ -335,8 +446,14 @@ export class FileSync {
 
   private readonly handleLocalDelete = (file: TAbstractFile): void => {
     if (this.destroyed || !this.canPublish()) return;
+    if (Array.from(this.deletingFolders).some((path) => file.path === path || file.path.startsWith(path + "/"))) return;
     if (file instanceof TFolder) {
+      if (this.remoteFolders.has(file.path) || !this.isTrackedFolder(file.path)) return;
       this.files.doc?.transact(() => {
+        for (const path of Array.from(this.folders.keys())) {
+          if (path.startsWith(file.path + "/") && this.isTrackedFolder(path)) this.folders.set(path, false);
+        }
+        this.folders.set(file.path, false);
         for (const [id] of this.files) {
           const path = this.paths.get(id) ?? id;
           if (path.startsWith(`${file.path}/`) && this.isTracked(path)) { this.files.delete(id); this.paths.delete(id); }
@@ -353,12 +470,21 @@ export class FileSync {
   private readonly handleLocalRename = async (file: TAbstractFile, oldPath: string): Promise<void> => {
     if (this.destroyed || !this.canPublish()) return;
     if (file instanceof TFolder) {
+      if (this.remoteFolders.has(file.path) || (!this.isTrackedFolder(oldPath) && !this.isTrackedFolder(file.path))) return;
       this.files.doc?.transact(() => {
+        const descendants = Array.from(this.folders).filter(([path, alive]) => alive && path.startsWith(oldPath + "/"));
+        if (this.isTrackedFolder(oldPath)) this.folders.set(oldPath, false);
+        if (this.isTrackedFolder(file.path)) this.recordParents(`${file.path}/folder-check.md`);
+        for (const [path] of descendants) {
+          if (this.isTrackedFolder(path)) this.folders.set(path, false);
+          const destination = file.path + path.slice(oldPath.length);
+          if (this.isTrackedFolder(destination)) this.recordParents(`${destination}/folder-check.md`);
+        }
         for (const [id] of Array.from(this.files.entries())) {
           const path = this.paths.get(id) ?? id;
           if (!path.startsWith(`${oldPath}/`) || !this.isTracked(path)) continue;
           const newPath = file.path + path.slice(oldPath.length);
-          if (this.isTracked(newPath)) this.paths.set(id, newPath);
+          if (this.isTracked(newPath)) { this.paths.set(id, newPath); this.recordParents(newPath); }
           else { this.files.delete(id); this.paths.delete(id); }
         }
       }, this);
@@ -373,7 +499,7 @@ export class FileSync {
     const entry = this.entry(oldPath);
     if (entry && this.isTracked(oldPath)) {
       this.files.doc?.transact(() => {
-        if (this.isTracked(file.path)) this.paths.set(entry[0], file.path);
+        if (this.isTracked(file.path)) { this.paths.set(entry[0], file.path); this.recordParents(file.path); }
         else { this.files.delete(entry[0]); this.paths.delete(entry[0]); }
       }, this);
     } else if (this.isTracked(file.path)) await this.handleLocalCreate(file);
