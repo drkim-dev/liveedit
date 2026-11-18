@@ -81,8 +81,14 @@ export class Room {
     return this.peers.size;
   }
 
+  private get hostPresent(): boolean { return Array.from(this.identities.values()).some((peer) => peer.host); }
+
   /** Register a new peer and send it the current doc + presence snapshot. */
   join(ws: WebSocket, host = false): void {
+    if (!host && (!this.hostPresent || this.doc.getMap("liveedit").get("initialized") !== true)) {
+      ws.close(4006, "방장이 먼저 방 개설하기를 눌러야 합니다");
+      return;
+    }
     if (this.locked && !host) {
       ws.close(4003, "방장이 신규 입장을 잠갔습니다");
       return;
@@ -112,13 +118,21 @@ export class Room {
 
   leave(ws: WebSocket): void {
     if (this.destroyed || !this.peers.has(ws)) return;
+    const wasHost = this.identities.get(ws)?.host;
     const ids = this.peers.get(ws);
     this.peers.delete(ws);
     this.identities.delete(ws);
+    if (wasHost && !this.hostPresent) {
+      this.locked = false;
+      for (const peer of Array.from(this.peers.keys())) {
+        peer.close(4007, "방장이 방을 닫았습니다. 다시 열리면 접속합니다");
+        this.leave(peer);
+      }
+    }
     if (ids && ids.size > 0) {
       awarenessProtocol.removeAwarenessStates(this.awareness, Array.from(ids), null);
     }
-    if (this.peers.size === 0) {
+    if (this.peers.size === 0 && this.emptyTimer === null) {
       try { this.flush(); } catch (error) {
         console.error("Room save failed; retaining the room in memory", error);
         return;
@@ -177,7 +191,7 @@ export class Room {
       if (ws.readyState !== ws.OPEN) continue;
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, 2);
-      encoding.writeVarString(encoder, JSON.stringify({ protocol: 2, host: identity.host, locked: this.locked, peers }));
+      encoding.writeVarString(encoder, JSON.stringify({ protocol: 2, lifecycle: 1, host: identity.host, locked: this.locked, peers }));
       ws.send(encoding.toUint8Array(encoder));
     }
   }

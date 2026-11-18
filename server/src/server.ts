@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import { Room } from "./room.js";
 import { resolve } from "node:path";
+import { isServerPeer } from "./host-auth.js";
 
 const PORT = Number(process.env.PORT ?? 1234);
 // Optional shared secret so randoms on the same LAN can't join without it.
@@ -34,7 +35,7 @@ const httpServer = createServer((req, res) => {
       "content-type": "application/json",
       "access-control-allow-origin": "*",
     });
-    res.end(JSON.stringify({ ok: true, rooms: rooms.size }));
+    res.end(JSON.stringify({ ok: true, version: "0.6.0", rooms: rooms.size }));
     return;
   }
   res.writeHead(404).end();
@@ -65,7 +66,12 @@ httpServer.on("upgrade", (req, socket, head) => {
       return;
     }
     ws.on("error", (error) => console.warn("Peer error:", error.message));
-    const host = !!HOST_TOKEN && url.searchParams.get("hostToken") === HOST_TOKEN;
+    const host = (!!HOST_TOKEN && url.searchParams.get("hostToken") === HOST_TOKEN) ||
+      (url.searchParams.get("role") === "host" && isServerPeer(req.socket.remoteAddress));
+    if (url.searchParams.get("role") === "host" && !host) {
+      ws.close(4001, "방 개설은 서버를 실행한 PC의 Obsidian에서 해주세요");
+      return;
+    }
     if (url.searchParams.has("hostToken") && !host) {
       ws.close(4001, "방장 인증 키가 올바르지 않습니다");
       return;
@@ -117,6 +123,14 @@ function shutdown(): void {
 }
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
+
+httpServer.on("error", (error: NodeJS.ErrnoException) => {
+  console.error(error.code === "EADDRINUSE"
+    ? `포트 ${PORT}에서 기존 서버가 실행 중입니다. 기존 서버 창을 닫고 start.cmd를 다시 실행해주세요.`
+    : `서버 시작 실패: ${error.message}`);
+  shutdown();
+  process.exitCode = 1;
+});
 
 httpServer.listen(PORT, () => {
   const address = httpServer.address();
