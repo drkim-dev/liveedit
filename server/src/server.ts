@@ -53,7 +53,8 @@ httpServer.on("upgrade", (req, socket, head) => {
     socket.destroy();
     return;
   }
-  if (SHARED_TOKEN && url.searchParams.get("token") !== SHARED_TOKEN) {
+  const localHostRequest = url.searchParams.get("role") === "host" && isServerPeer(req.socket.remoteAddress);
+  if (SHARED_TOKEN && url.searchParams.get("token") !== SHARED_TOKEN && !localHostRequest) {
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
     socket.destroy();
     return;
@@ -67,7 +68,7 @@ httpServer.on("upgrade", (req, socket, head) => {
     }
     ws.on("error", (error) => console.warn("Peer error:", error.message));
     const host = (!!HOST_TOKEN && url.searchParams.get("hostToken") === HOST_TOKEN) ||
-      (url.searchParams.get("role") === "host" && isServerPeer(req.socket.remoteAddress));
+      localHostRequest;
     if (url.searchParams.get("role") === "host" && !host) {
       ws.close(4001, "방 개설은 서버를 실행한 PC의 Obsidian에서 해주세요");
       return;
