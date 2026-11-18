@@ -1,6 +1,6 @@
 export class TAbstractFile { constructor(public path: string) {} }
 export class TFile extends TAbstractFile {}
-export class TFolder extends TAbstractFile {}
+export class TFolder extends TAbstractFile { children: TAbstractFile[] = []; }
 export class Notice { constructor(_message: string) {} }
 export class Plugin {
   constructor(public app: any) {}

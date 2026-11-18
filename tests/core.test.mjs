@@ -617,3 +617,127 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+
+async function folderPeers(initial = { "Team/Sub/note.md": "shared" }, remoteExtra = {}) {
+  const a = new Y.Doc(), b = new Y.Doc();
+  const va = memoryVault(initial), vb = memoryVault({ ...initial, ...remoteExtra });
+  await va.vault.createFolder("Team/Empty/Deep");
+  const sa = new FileSync({ vault: va.vault }, a, () => "Team", true);
+  await sa.start(); Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+  const sb = new FileSync({ vault: vb.vault }, b, () => "Team", false);
+  await sb.start();
+  let online = true;
+  a.on("update", (update, origin) => { if (online && origin !== "wire") Y.applyUpdate(b, update, "wire"); });
+  b.on("update", (update, origin) => { if (online && origin !== "wire") Y.applyUpdate(a, update, "wire"); });
+  return { a, b, va, vb, sa, sb, offline() { online = false; },
+    async settle() { await sa.settled(true); await sb.settled(true); },
+    async close() { sa.destroy(); sb.destroy(); await sa.settled(); await sb.settled(); a.destroy(); b.destroy(); } };
+}
+
+test("folder create, recursive delete, empty folder delete and rapid recreation synchronize both ways", async () => {
+  const env = await folderPeers();
+  const { a, b, va, vb, sa, sb } = env;
+  try {
+    assert.ok(vb.entries.has("Team/Empty/Deep"));
+    await va.vault.trash(va.entries.get("Team/Sub")); await env.settle();
+    assert.equal(vb.entries.has("Team/Sub/note.md"), false);
+    assert.equal(vb.entries.has("Team/Sub"), false);
+    assert.equal(b.getMap("folderStates").get("Team/Sub"), false);
+    assert.ok([...vb.contents].some(([path, content]) => path.startsWith(".liveedit-backups/") && content === "shared"));
+    await vb.vault.trash(vb.entries.get("Team/Empty")); await env.settle();
+    assert.equal(va.entries.has("Team/Empty"), false); assert.equal(va.entries.has("Team/Empty/Deep"), false);
+    await va.vault.createFolder("Team/Again/Nested"); await env.settle();
+    assert.ok(vb.entries.has("Team/Again/Nested"));
+    await va.vault.trash(va.entries.get("Team/Again"));
+    await va.vault.createFolder("Team/Again/Nested"); await env.settle();
+    assert.ok(vb.entries.has("Team/Again/Nested"));
+    assert.equal(a.getMap("folderStates").get("Team/Again"), true);
+    assert.equal(b.getMap("folderStates").get("Team/Again"), true);
+  } finally { await env.close(); }
+});
+
+test("folder rename moves empty descendants and preserves text identity, deletion records survive reconnect", async () => {
+  const env = await folderPeers(); const { a, b, va, vb, sa, sb } = env;
+  let rejoined, saved;
+  try {
+    await va.vault.createFolder("Team/Sub/Empty"); await env.settle();
+    const text = sa.getOrCreateText("Team/Sub/note.md");
+    await va.vault.rename(va.entries.get("Team/Sub"), "Team/Renamed"); await env.settle();
+    assert.equal(sa.getOrCreateText("Team/Renamed/note.md"), text);
+    assert.equal(sb.hasText("Team/Sub/note.md"), false);
+    assert.equal(vb.entries.has("Team/Sub"), false);
+    assert.ok(vb.entries.has("Team/Renamed/Empty"));
+    const staleVault = memoryVault({ "Team/Renamed/note.md": "offline stale" });
+    await staleVault.vault.createFolder("Team/Renamed/Empty");
+    await staleVault.vault.createFolder("Team/OldLeftover/Empty");
+    await va.vault.trash(va.entries.get("Team/Renamed")); await env.settle();
+    saved = new Y.Doc(); Y.applyUpdate(saved, Y.encodeStateAsUpdate(a));
+    rejoined = new FileSync({ vault: staleVault.vault }, saved, () => "Team", false);
+    await rejoined.start(); await rejoined.settled(true);
+    assert.equal(staleVault.entries.has("Team/Renamed"), false);
+    assert.equal(staleVault.entries.has("Team/Renamed/Empty"), false);
+    assert.equal(staleVault.entries.has("Team/OldLeftover"), false);
+    assert.ok([...staleVault.contents].some(([path, content]) => path.startsWith(".liveedit-backups/") && content === "offline stale"));
+  } finally { rejoined?.destroy(); await rejoined?.settled(); saved?.destroy(); await env.close(); }
+});
+
+test("concurrent folder deletion and edits do not resurrect old notes or erase concurrent new notes", async () => {
+  const env = await folderPeers(); const { a, b, va, vb, sa, sb } = env;
+  try {
+    env.offline();
+    await va.vault.trash(va.entries.get("Team/Sub"));
+    sb.getOrCreateText("Team/Sub/note.md").insert(6, " remote work");
+    await vb.vault.create("Team/Sub/new.md", "new concurrent note");
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(b), "wire");
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a), "wire");
+    await env.settle();
+    for (const fixture of [va, vb]) {
+      assert.equal(fixture.entries.has("Team/Sub/note.md"), false);
+      assert.equal(fixture.contents.get("Team/Sub/new.md"), "new concurrent note");
+      assert.ok(fixture.entries.has("Team/Sub"));
+    }
+    assert.ok([...vb.contents].some(([path, content]) => path.startsWith(".liveedit-backups/") && content.includes("remote work")));
+  } finally { await env.close(); }
+});
+
+test("remote folder deletion retains local attachments, hidden files and unrelated folders", async () => {
+  const env = await folderPeers(undefined, { "Team/Sub/image.png": "attachment", "Team/Sub/.private.md": "hidden", "Other/personal.md": "private" });
+  const { va, vb } = env;
+  try {
+    await va.vault.trash(va.entries.get("Team/Sub")); await env.settle();
+    assert.equal(vb.contents.has("Team/Sub/note.md"), false);
+    assert.equal(vb.contents.get("Team/Sub/image.png"), "attachment");
+    assert.equal(vb.contents.get("Team/Sub/.private.md"), "hidden");
+    assert.equal(vb.contents.get("Other/personal.md"), "private");
+    assert.ok(vb.entries.has("Team/Sub"));
+  } finally { await env.close(); }
+});
+
+
+test("a new shared note arriving during folder trash is restored without publishing a deletion", async () => {
+  const env = await folderPeers(); const { va, vb, b, sb } = env;
+  const originalTrash = vb.vault.trash;
+  let releaseTrash, enteredTrash;
+  const entered = new Promise((resolve) => enteredTrash = resolve);
+  vb.vault.trash = async (file, ...args) => {
+    if (file.path === "Team/Sub") {
+      enteredTrash(); await new Promise((resolve) => releaseTrash = resolve);
+    }
+    return originalTrash(file, ...args);
+  };
+  try {
+    await va.vault.trash(va.entries.get("Team/Sub"));
+    await entered;
+    // Simulate another peer's file reaching disk while the earlier trash awaits I/O.
+    b.transact(() => {
+      b.getMap("files").set("Team/Sub/new.md", new Y.Text("new data"));
+      b.getMap("filePaths").set("Team/Sub/new.md", "Team/Sub/new.md");
+    }, "wire");
+    await vb.vault.create("Team/Sub/new.md", "new data");
+    releaseTrash(); await env.settle();
+    assert.equal(sb.hasText("Team/Sub/new.md"), true);
+    assert.equal(vb.contents.get("Team/Sub/new.md"), "new data");
+    assert.equal(vb.contents.has("Team/Sub/note.md"), false);
+  } finally { releaseTrash?.(); await env.close(); }
+});
