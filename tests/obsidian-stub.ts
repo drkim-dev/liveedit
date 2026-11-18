@@ -5,11 +5,27 @@ export class Notice { constructor(_message: string) {} }
 export class Plugin {
   constructor(public app: any) {}
   async saveData(_value: unknown): Promise<void> {}
+  registerView() {}
+  addRibbonIcon() {}
+  registerEvent() {}
 }
 export class MarkdownView {
   constructor(public file: TFile | null, public editor: any) {}
 }
-export class Modal { constructor(public app: any) {} }
+function contentElement(): any {
+  if (typeof document === "undefined") return {};
+  return document.createElement("div");
+}
+export class Modal {
+  contentEl = contentElement();
+  constructor(public app: any) {}
+  open() { (this as any).onOpen(); }
+}
+export class ItemView {
+  app: any;
+  contentEl = contentElement();
+  constructor(leaf: any) { this.app = leaf.app; }
+}
 export class PluginSettingTab {
   containerEl: any = { empty() {}, createEl() {} };
   constructor(public app: any, public plugin: any) {}

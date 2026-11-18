@@ -35,7 +35,7 @@ test("settings connection button follows connect/reconnect/disconnect state", as
   let status = "disconnected", active = false;
   const notify = () => { for (const callback of listeners) callback(); };
   const plugin = {
-    settings: { ...DEFAULT_SETTINGS },
+    settings: { ...DEFAULT_SETTINGS, displayName: "Tester" },
     getConnectionStatus: () => status, isConnected: () => active,
     onConnectionChange: (callback) => { listeners.add(callback); return () => listeners.delete(callback); },
     reconnect: async () => { active = true; status = "connecting"; notify(); await pause(1); status = "connected"; notify(); },
@@ -63,7 +63,7 @@ test("host uses Open room and Close room with no room-code or host-key settings"
   let status = "disconnected", opened = 0, active = false;
   const notify = () => { for (const callback of listeners) callback(); };
   const plugin = {
-    settings: { ...DEFAULT_SETTINGS, role: "host" },
+    settings: { ...DEFAULT_SETTINGS, role: "host", displayName: "Host" },
     getConnectionStatus: () => status, isConnected: () => active,
     onConnectionChange: (callback) => { listeners.add(callback); return () => listeners.delete(callback); },
     reconnect: async () => { opened++; active = true; status = "connected"; notify(); },
@@ -84,7 +84,7 @@ test("host uses Open room and Close room with no room-code or host-key settings"
 
 test("host plugin startup does not open a room automatically", async () => {
   const fixture = memoryVault({}, PluginFile, PluginFolder);
-  const plugin = new LiveEditPlugin({ vault: fixture.vault, workspace: { getLeavesOfType: () => [] } });
+  const plugin = new LiveEditPlugin({ vault: fixture.vault, workspace: { getLeavesOfType: () => [], getActiveViewOfType: () => null, getActiveFile: () => null, getLeftLeaf: () => null, on: () => ({}) } });
   plugin.loadData = async () => ({ ...DEFAULT_SETTINGS, role: "host", autoReconnect: true });
   plugin.addStatusBarItem = () => ({ style: {}, addClass() {}, setText() {} });
   for (const method of ["registerDomEvent", "addSettingTab", "registerEditorExtension", "addCommand"]) plugin[method] = () => {};
@@ -452,6 +452,25 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     await member.waitUntilSynced();
     assert.equal(host.roomState.host, true);
     assert.equal(member.roomState.host, false);
+    const blank = new WebSocket(address + "&protocol=2&name=%20%20&clientId=456");
+    assert.equal(await new Promise((resolve) => blank.once("close", (code) => resolve(code))), 4009);
+    const extra = Array.from({ length: 14 }, () => client());
+    await Promise.all(extra.map((peer) => peer.waitUntilSynced()));
+    await until(() => host.roomState.peers.length === 16);
+    assert.equal(new Set(host.roomState.peers.map((peer) => peer.color)).size, 16, "colors stay unique beyond the palette");
+    const assigned = member.awareness.getLocalState().user.color;
+    assert.match(assigned, /^#[0-9a-f]{6}$/);
+    member.awareness.setLocalStateField("user", { name: "forged", color: host.awareness.getLocalState().user.color });
+    member.awareness.setLocalStateField("viewingFile", "Team/test.md");
+    member.awareness.setLocalStateField("line", 12);
+    member.awareness.setLocalStateField("editingUntil", Date.now() + 4000);
+    await until(() => host.awareness.getStates().get(member.doc.clientID)?.line === 12);
+    assert.equal(host.awareness.getStates().get(member.doc.clientID).user.name, "Member");
+    assert.equal(host.awareness.getStates().get(member.doc.clientID).user.color, assigned);
+    for (const peer of extra) peer.disconnect();
+    await until(() => host.roomState.peers.length === 2);
+    member.awareness.setLocalStateField("user", { name: "Member", color: assigned });
+
     const text = new Y.Text("initial");
     host.doc.getMap("files").set("Team/test.md", text);
     host.doc.getMap("files").set("Team/keep.md", new Y.Text("keep"));
@@ -483,8 +502,8 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     // exact manual reconnect action used by the settings button.
     const fixture = memoryVault({ "Team/test.md": "old local", "Team/extra.md": "local extra" }, PluginFile, PluginFolder);
     const personalVault = memoryVault({ "Personal/note.md": "private" }, PluginFile, PluginFolder);
-    plugin = new LiveEditPlugin({ vault: fixture.vault, workspace: { getLeavesOfType: () => [] } });
-    plugin.settings = { ...DEFAULT_SETTINGS, serverUrl: address, room: "team", sharedFolder: "" };
+    plugin = new LiveEditPlugin({ vault: fixture.vault, workspace: { getLeavesOfType: () => [], getActiveViewOfType: () => null, getActiveFile: () => null, getLeftLeaf: () => null, on: () => ({}) } });
+    plugin.settings = { ...DEFAULT_SETTINGS, displayName: "Plugin tester", serverUrl: address, room: "team", sharedFolder: "" };
     plugin.statusBar = { render() {} };
     await plugin.connect();
     assert.equal(plugin.ready, true);
@@ -567,7 +586,7 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     await until(() => member.lastError.includes("종료"));
     await pause(2200);
     assert.equal(member.status, "disconnected", "kicked clients must not automatically rejoin");
-    const malformed = new WebSocket(address + "&protocol=2");
+    const malformed = new WebSocket(address + "&protocol=2&name=Malformed&clientId=123");
     await new Promise((resolve) => malformed.once("open", resolve));
     const closed = new Promise((resolve) => malformed.once("close", (code) => resolve(code)));
     malformed.send(Buffer.from([0, 255]));
