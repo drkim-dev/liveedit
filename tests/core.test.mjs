@@ -93,6 +93,34 @@ test("unloading the guard does not leave locks in another plugin's wrapper", asy
   assert.equal(fixture.contents.get("Team/unlocked.md"), "plugin disabled");
 });
 
+test("vault-wide mode needs no folder and leaves other vaults and configuration alone", async () => {
+  const shared = memoryVault({ "root.md": "shared", "Notes/note.md": "shared" }, PluginFile, PluginFolder);
+  const personal = memoryVault({ "personal.md": "private" }, PluginFile, PluginFolder);
+  const guard = new VaultGuard(shared.vault, () => "", () => false);
+  try {
+    await assert.rejects(shared.vault.modify(shared.entries.get("root.md"), "blocked"));
+    await assert.rejects(shared.vault.create("Notes/new.md", "blocked"));
+    await shared.vault.create(".obsidian/config.md", "settings");
+    await shared.vault.create(".liveedit-backups/copy.md", "backup");
+    await personal.vault.modify(personal.entries.get("personal.md"), "private offline work");
+    assert.equal(personal.contents.get("personal.md"), "private offline work");
+  } finally { guard.destroy(); }
+});
+
+test("legacy host scope import adds remaining vault notes without replacing shared content", async () => {
+  const doc = new Y.Doc(); doc.getMap("files").set("Team/note.md", new Y.Text("canonical"));
+  const fixture = memoryVault({ "Team/note.md": "old", "root.md": "root note", "Other/note.md": "other folder", ".obsidian/config.md": "ignore" });
+  const sync = new FileSync({ vault: fixture.vault }, doc, () => "", true);
+  try {
+    await sync.start();
+    await sync.importLocalNotes();
+    assert.equal(sync.getOrCreateText("Team/note.md").toString(), "canonical");
+    assert.equal(sync.getOrCreateText("root.md").toString(), "root note");
+    assert.equal(sync.getOrCreateText("Other/note.md").toString(), "other folder");
+    assert.equal(sync.hasText(".obsidian/config.md"), false);
+  } finally { sync.destroy(); doc.destroy(); }
+});
+
 test("file scope rejects traversal, hidden configuration, and unrelated folders", () => {
   const doc = new Y.Doc();
   const sync = new FileSync({}, doc, () => "Team");
@@ -400,19 +428,22 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     assert.equal(host.doc.getMap("files").has("Team/offline-new.md"), false);
     // Exercise the plugin lifecycle too, including disk reconciliation and the
     // exact manual reconnect action used by the settings button.
-    const fixture = memoryVault({ "Team/test.md": "old local", "Team/extra.md": "local extra", "Personal/note.md": "private" }, PluginFile, PluginFolder);
+    const fixture = memoryVault({ "Team/test.md": "old local", "Team/extra.md": "local extra" }, PluginFile, PluginFolder);
+    const personalVault = memoryVault({ "Personal/note.md": "private" }, PluginFile, PluginFolder);
     plugin = new LiveEditPlugin({ vault: fixture.vault, workspace: { getLeavesOfType: () => [] } });
-    plugin.settings = { ...DEFAULT_SETTINGS, serverUrl: address, room: "team", sharedFolder: "Team" };
+    plugin.settings = { ...DEFAULT_SETTINGS, serverUrl: address, room: "team", sharedFolder: "" };
     plugin.statusBar = { render() {} };
     await plugin.connect();
     assert.equal(plugin.ready, true);
+    assert.equal(plugin.isReadOnlyPath("root.md"), false);
     assert.equal(fixture.contents.get("Team/test.md"), "remote initial");
     assert.equal(fixture.contents.has("Team/extra.md"), false);
     plugin.connection.ws.terminate();
     await until(() => plugin.getConnectionStatus() === "disconnected");
     assert.equal(plugin.canEditShared(), false);
-    await fixture.vault.modify(fixture.entries.get("Personal/note.md"), "private offline work");
-    assert.equal(fixture.contents.get("Personal/note.md"), "private offline work");
+    assert.equal(plugin.isReadOnlyPath("root.md"), true);
+    await personalVault.vault.modify(personalVault.entries.get("Personal/note.md"), "private offline work");
+    assert.equal(personalVault.contents.get("Personal/note.md"), "private offline work");
     await assert.rejects(fixture.vault.modify(fixture.entries.get("Team/test.md"), "blocked offline draft"));
     // External tools bypass the app guard. Their changes still must not upload.
     fixture.contents.set("Team/test.md", "auto offline draft");
@@ -451,7 +482,7 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     assert.equal(plugin.ready, true);
     assert.equal(fixture.contents.get("Team/test.md"), "fresh remote initial");
     assert.equal(text.toString(), "fresh remote initial");
-    assert.equal(fixture.contents.get("Personal/note.md"), "private offline work");
+    assert.equal(personalVault.contents.get("Personal/note.md"), "private offline work");
     assert.ok([...fixture.contents.values()].includes("manual offline draft"));
     plugin.disconnect();
     await pause(400);
