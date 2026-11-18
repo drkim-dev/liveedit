@@ -1,0 +1,11 @@
+import { build } from "esbuild";
+import { spawnSync } from "node:child_process";
+import { mkdirSync } from "node:fs";
+mkdirSync("tests/generated", { recursive: true });
+await build({ entryPoints: ["src/connection.ts"], bundle: true, platform: "node", format: "cjs", packages: "external", outfile: "tests/generated/connection.cjs" });
+await build({ entryPoints: ["tests/file-sync-entry.ts"], bundle: true, platform: "node", format: "cjs", packages: "external", alias: { obsidian: "./tests/obsidian-stub.ts" }, outfile: "tests/generated/file-sync.cjs" });
+await build({ entryPoints: ["tests/obsidian-stub.ts"], bundle: true, platform: "node", format: "cjs", outfile: "tests/generated/obsidian.cjs" });
+await build({ entryPoints: ["tests/editor-entry.ts"], bundle: true, platform: "node", format: "cjs", packages: "external", alias: { obsidian: "./tests/obsidian-stub.ts" }, outfile: "tests/generated/editor.cjs" });
+await build({ entryPoints: ["tests/plugin-entry.ts"], bundle: true, platform: "node", format: "cjs", packages: "external", alias: { obsidian: "./tests/obsidian-stub.ts" }, outfile: "tests/generated/plugin.cjs" });
+const result = spawnSync(process.execPath, ["--test", "tests/core.test.mjs", "tests/editor.test.mjs"], { stdio: "inherit" });
+process.exitCode = result.status ?? 1;

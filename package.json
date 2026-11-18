@@ -1,10 +1,11 @@
 {
   "name": "liveedit",
-  "version": "0.3.1",
+  "version": "0.5.1",
   "description": "Same-network real-time collaborative note editing for Obsidian, Notion-style.",
   "main": "main.js",
   "private": true,
   "scripts": {
+    "test": "npm --prefix server run build && node tests/run.mjs",
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "version": "node version-bump.mjs && git add manifest.json versions.json"
@@ -13,11 +14,12 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "@codemirror/state": "^6.4.1",
-    "@codemirror/view": "^6.28.0",
+    "@codemirror/state": "6.5.0",
+    "@codemirror/view": "6.38.6",
     "@types/node": "^20.14.10",
     "builtin-modules": "^3.3.0",
     "esbuild": "^0.21.5",
+    "jsdom": "^31.0.1",
     "obsidian": "^1.5.7",
     "tslib": "^2.6.3",
     "typescript": "^5.5.4"

@@ -1,18 +1,21 @@
 import { createServer } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import { Room } from "./room.js";
+import { resolve } from "node:path";
 
 const PORT = Number(process.env.PORT ?? 1234);
 // Optional shared secret so randoms on the same LAN can't join without it.
 // Leave COVAULT_TOKEN unset to allow any client on the private network in.
 const SHARED_TOKEN = process.env.LIVEEDIT_TOKEN;
+const HOST_TOKEN = process.env.LIVEEDIT_HOST_TOKEN;
+const DATA_DIR = resolve(process.env.LIVEEDIT_DATA_DIR ?? "./data");
 
 const rooms = new Map<string, Room>();
 
 function getOrCreateRoom(name: string): Room {
   let room = rooms.get(name);
   if (!room) {
-    room = new Room(name, (emptyName) => rooms.delete(emptyName));
+    room = new Room(name, (emptyName) => rooms.delete(emptyName), DATA_DIR);
     rooms.set(name, room);
   }
   return room;
@@ -37,13 +40,15 @@ const httpServer = createServer((req, res) => {
   res.writeHead(404).end();
 });
 
-const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 16 * 1024 * 1024 });
 
 httpServer.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url ?? "/", "http://relay");
-  const roomName = decodeURIComponent(url.pathname.replace(/^\//, ""));
+  let roomName: string;
+  try { roomName = decodeURIComponent(url.pathname.replace(/^\//, "")); }
+  catch { socket.destroy(); return; }
 
-  if (!roomName) {
+  if (!roomName || roomName.length > 200) {
     socket.destroy();
     return;
   }
@@ -54,15 +59,66 @@ httpServer.on("upgrade", (req, socket, head) => {
   }
 
   wss.handleUpgrade(req, socket, head, (ws) => {
-    const room = getOrCreateRoom(roomName);
-    room.join(ws);
+    wss.emit("connection", ws, req);
+    if (url.searchParams.get("protocol") !== "2") {
+      ws.close(4005, "LiveEdit 플러그인을 0.5.0 이상으로 업데이트해주세요");
+      return;
+    }
+    ws.on("error", (error) => console.warn("Peer error:", error.message));
+    const host = !!HOST_TOKEN && url.searchParams.get("hostToken") === HOST_TOKEN;
+    if (url.searchParams.has("hostToken") && !host) {
+      ws.close(4001, "방장 인증 키가 올바르지 않습니다");
+      return;
+    }
+    let room: Room;
+    try { room = getOrCreateRoom(roomName); }
+    catch (error) {
+      console.error("Room load failed", error);
+      ws.close(1011, "방 데이터를 불러올 수 없습니다");
+      return;
+    }
+    room.join(ws, host);
 
-    ws.on("message", (data) => room.handleMessage(ws, toUint8Array(data)));
+    ws.on("message", (data, binary) => {
+      try {
+        if (!binary) { ws.close(1003, "Binary messages required"); return; }
+        room.handleMessage(ws, toUint8Array(data));
+      } catch { ws.close(1002, "Invalid message"); }
+    });
     ws.on("close", () => room.leave(ws));
     ws.on("error", () => room.leave(ws));
   });
 });
 
+const alive = new WeakMap<WebSocket, boolean>();
+wss.on("connection", (ws) => {
+  alive.set(ws, true);
+  ws.on("pong", () => alive.set(ws, true));
+});
+const heartbeat = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (alive.get(ws) === false) { ws.terminate(); continue; }
+    alive.set(ws, false);
+    ws.ping();
+    ws.send(new Uint8Array([3]));
+  }
+}, 20000);
+wss.on("close", () => clearInterval(heartbeat));
+
+function shutdown(): void {
+  clearInterval(heartbeat);
+  for (const room of rooms.values()) {
+    try { room.flush(); } catch (error) { console.error("Final save failed", error); }
+    room.destroy();
+  }
+  for (const ws of wss.clients) ws.terminate();
+  wss.close();
+  httpServer.close();
+}
+process.once("SIGINT", shutdown);
+process.once("SIGTERM", shutdown);
+
 httpServer.listen(PORT, () => {
-  console.log(`liveedit relay listening on :${PORT}`);
+  const address = httpServer.address();
+  console.log(`liveedit relay listening on :${typeof address === "object" && address ? address.port : PORT}`);
 });

@@ -4,6 +4,8 @@ import { createLiveEditExtension, ActiveSession } from "./editor-binding";
 import { FileSync } from "./file-sync";
 import { ParticipantsModal, StatusBarWidget } from "./presence";
 import { DEFAULT_SETTINGS, LiveEditSettings, LiveEditSettingTab } from "./settings";
+import { inSharedFolder, validSharedFolder } from "./shared-scope";
+import { VaultGuard } from "./vault-guard";
 
 export default class LiveEditPlugin extends Plugin {
   settings!: LiveEditSettings;
@@ -28,9 +30,68 @@ export default class LiveEditPlugin extends Plugin {
   private statusBar!: StatusBarWidget;
   private unsubscribeStatus: (() => void) | null = null;
   private awarenessChangeHandler: (() => void) | null = null;
+  private readonly connectionListeners = new Set<() => void>();
+  private reconnecting = false;
+  private pendingDrafts = new Map<string, string>();
+  private vaultGuard: VaultGuard | null = null;
+
+  getConnectionStatus(): ConnectionStatus {
+    const status = this.connection?.status ?? "disconnected";
+    return status === "connected" && !this.ready ? "syncing" : status;
+  }
+  canEditShared(): boolean { return this.ready && this.connection?.status === "connected"; }
+  isReadOnlyPath(path: string): boolean {
+    return inSharedFolder(path, this.settings.sharedFolder) && !this.canEditShared();
+  }
+  private installVaultGuard(): void {
+    if (!this.vaultGuard) this.vaultGuard = new VaultGuard(this.app.vault, () => this.settings.sharedFolder, () => this.canEditShared());
+  }
+  onConnectionChange(callback: () => void): () => void {
+    this.connectionListeners.add(callback);
+    return () => this.connectionListeners.delete(callback);
+  }
+  private notifyConnection(): void { for (const listener of this.connectionListeners) listener(); }
+
+  private async suspendSession(): Promise<Map<string, string>> {
+    this.ready = false;
+    const drafts = this.fileSync?.snapshot() ?? new Map<string, string>();
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      if (leaf.view instanceof MarkdownView && leaf.view.file && this.fileSync?.isTracked(leaf.view.file.path)) {
+        drafts.set(leaf.view.file.path, leaf.view.editor.getValue());
+      }
+    }
+    const sync = this.fileSync;
+    this.session = null;
+    this.fileSync = null;
+    sync?.destroy();
+    this.nudgeOpenEditors();
+    await Promise.resolve();
+    await sync?.settled();
+    return drafts;
+  }
+
+  async reconnect(): Promise<void> {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+    try {
+      if (this.settings.role === "host" && this.connection) {
+        this.connection.disconnect();
+        this.connection.connect();
+        await this.connection.waitUntilSynced();
+        return;
+      }
+      const drafts = await this.suspendSession();
+      for (const [path, content] of drafts) this.pendingDrafts.set(path, content);
+      this.disconnect();
+      await this.connect();
+    } catch (error) {
+      new Notice(`LiveEdit: 재접속을 완료하지 못했습니다. ${String(error)}`, 10000);
+    } finally { this.reconnecting = false; }
+  }
 
   async onload(): Promise<void> {
     await this.loadSettings();
+    this.installVaultGuard();
 
     const statusBarEl = this.addStatusBarItem();
     statusBarEl.style.cursor = "pointer";
@@ -43,6 +104,8 @@ export default class LiveEditPlugin extends Plugin {
     this.registerEditorExtension(
       createLiveEditExtension({
         getSession: () => this.getSession(),
+        isReadOnlyPath: (path) => this.isReadOnlyPath(path),
+        onAccessChange: (callback) => this.onConnectionChange(callback),
       }),
     );
 
@@ -50,6 +113,11 @@ export default class LiveEditPlugin extends Plugin {
       id: "connect",
       name: "세션 연결",
       callback: () => this.connect(),
+    });
+    this.addCommand({
+      id: "reconnect",
+      name: "세션 재접속",
+      callback: () => this.reconnect(),
     });
     this.addCommand({
       id: "disconnect",
@@ -75,6 +143,8 @@ export default class LiveEditPlugin extends Plugin {
 
   onunload(): void {
     this.disconnect();
+    this.vaultGuard?.destroy();
+    this.vaultGuard = null;
   }
 
   isConnected(): boolean {
@@ -82,12 +152,14 @@ export default class LiveEditPlugin extends Plugin {
   }
 
   private getSession(): ActiveSession | null {
-    if (!this.ready || !this.connection || this.connection.status !== "connected") return null;
+    if (!this.canEditShared()) return null;
     return this.session;
   }
 
   async connect(): Promise<void> {
+    this.installVaultGuard();
     if (this.connection) {
+      if (this.connection.status === "disconnected") { await this.reconnect(); return; }
       new Notice("LiveEdit: 이미 연결되어 있습니다.");
       return;
     }
@@ -95,38 +167,106 @@ export default class LiveEditPlugin extends Plugin {
       new Notice("LiveEdit: 방 코드를 설정에서 입력해주세요.");
       return;
     }
+    if (!validSharedFolder(this.settings.sharedFolder)) {
+      new Notice("LiveEdit: 개인 노트와 구분할 공유 폴더를 먼저 지정해주세요. 예: Team");
+      return;
+    }
 
     let url: string;
     try {
       url = buildRoomUrl(this.settings.serverUrl, this.settings.room);
+      const parsed = new URL(url);
+      parsed.searchParams.delete("hostToken");
+      if (this.settings.role === "host") {
+        if (!this.settings.hostToken.trim()) {
+          new Notice("LiveEdit: 방장 인증 키를 설정해주세요. 서버의 LIVEEDIT_HOST_TOKEN과 같아야 합니다.");
+          return;
+        }
+        parsed.searchParams.set("hostToken", this.settings.hostToken.trim());
+      }
+      url = parsed.toString();
     } catch {
       new Notice("LiveEdit: 서버 주소가 올바르지 않습니다. 설정을 확인해주세요.");
       return;
     }
 
-    const connection = new LiveEditConnection(url, this.settings.autoReconnect);
+    const isHost = this.settings.role === "host";
+    const connection = new LiveEditConnection(url, this.settings.autoReconnect, !isHost);
     connection.awareness.setLocalStateField("user", {
       name: this.settings.displayName.trim() || "익명",
       color: this.settings.color,
     });
 
-    const fileSync = new FileSync(this.app, connection.doc, () => this.settings.sharedFolder);
-
+    const sharedFolder = this.settings.sharedFolder;
     this.connection = connection;
-    this.fileSync = fileSync;
-    this.session = { awareness: connection.awareness, fileSync };
+    let initialization: Promise<void> = Promise.resolve();
 
     const refreshStatusBar = (): void => {
       const remoteCount = connection.awareness.getStates().size - 1;
-      this.statusBar.render(connection.status, Math.max(0, remoteCount), this.settings.role);
+      this.statusBar.render(this.getConnectionStatus(), Math.max(0, remoteCount), this.settings.role);
+      this.notifyConnection();
+    };
+
+    connection.beforeReset = async () => {
+      for (const [path, content] of await this.suspendSession()) this.pendingDrafts.set(path, content);
+      if (this.awarenessChangeHandler) connection.awareness.off("change", this.awarenessChangeHandler);
+    };
+
+    const initialize = async (): Promise<void> => {
+      if (this.connection !== connection) return;
+      if (connection.roomState?.protocol !== 2) throw new Error("릴레이 서버를 0.5.0 이상으로 업데이트해주세요.");
+      if (isHost && this.session && this.fileSync) {
+        await Promise.resolve();
+        await this.fileSync.resynchronize();
+        if (this.connection !== connection || connection.status !== "connected") return;
+        this.ready = true;
+        this.nudgeOpenEditors();
+        refreshStatusBar();
+        return;
+      }
+      connection.awareness.off("change", refreshStatusBar);
+      connection.awareness.on("change", refreshStatusBar);
+      const sync = new FileSync(this.app, connection.doc, () => sharedFolder, isHost, this.pendingDrafts,
+        () => this.canEditShared(), this.vaultGuard!.internalVault);
+      for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+        if (leaf.view instanceof MarkdownView && leaf.view.file && sync.isTracked(leaf.view.file.path)) {
+          this.pendingDrafts.set(leaf.view.file.path, leaf.view.editor.getValue());
+        }
+      }
+      this.fileSync = sync;
+      await sync.start();
+      await sync.settled(true);
+      if (this.connection !== connection || connection.status !== "connected" || this.fileSync !== sync) {
+        sync.destroy();
+        return;
+      }
+      this.pendingDrafts = new Map();
+      this.session = { awareness: connection.awareness, fileSync: sync };
+      this.ready = true;
+      this.hasBeenReady = true;
+      this.nudgeOpenEditors();
+      refreshStatusBar();
     };
 
     const handleStatusChange = (status: ConnectionStatus): void => {
+      if (status !== "connected") {
+        this.ready = false;
+        this.nudgeOpenEditors();
+      }
       refreshStatusBar();
+      if (status === "connected") {
+        initialization = initialize();
+        void initialization.catch((error) => {
+          if (this.connection === connection) {
+            this.disconnect();
+            new Notice(`LiveEdit: 파일 동기화에 실패했습니다. ${String(error)}`, 10000);
+          }
+        });
+      }
       if (!this.hasBeenReady) return; // this is just the initial connect settling in, not a real drop
       if (status === "disconnected") {
         new Notice(
-          "⚠️ LiveEdit 연결이 끊어졌습니다. 재연결을 시도하는 중입니다. 지금 입력하는 내용은 재연결되는 순간 팀의 최신 내용으로 대체될 수 있으니 잠시 기다려주세요.",
+          `LiveEdit: ${connection.lastError} · ${isHost ? "미전송 변경을 보관합니다." : "재접속 시 로컬 사본을 보관한 뒤 공용 문서 상태를 받아옵니다."}`,
           10000,
         );
       } else if (status === "connected") {
@@ -143,13 +283,26 @@ export default class LiveEditPlugin extends Plugin {
     connection.connect();
     // Wait for the initial handshake to settle so we don't seed the shared
     // doc from a stale local copy while the room's real content is in flight.
-    await connection.waitUntilSynced();
-    await fileSync.start();
-    // Only now is it safe for editors to bind to shared Y.Text instances.
-    if (this.connection === connection) {
-      this.ready = true;
-      this.hasBeenReady = true;
-      this.nudgeOpenEditors();
+    try {
+      let warned = false;
+      while (this.connection === connection) {
+        try { await connection.waitUntilSynced(); break; }
+        catch (error) {
+          if (!connection.willReconnect || this.connection !== connection) throw error;
+          if (!warned) {
+            new Notice("LiveEdit: 서버 응답을 기다리며 자동 재접속 중입니다. 동기화 전에는 로컬 파일을 업로드하지 않습니다.", 8000);
+            warned = true;
+          }
+        }
+      }
+      if (this.connection !== connection) return;
+      await initialization;
+    } catch (error) {
+      if (this.connection === connection) {
+        this.disconnect();
+        new Notice(`LiveEdit: 연결을 완료하지 못했습니다. ${String(error)}`, 10000);
+      }
+      return;
     }
   }
 
@@ -170,6 +323,12 @@ export default class LiveEditPlugin extends Plugin {
 
   disconnect(): void {
     if (!this.connection) return;
+    for (const [path, content] of this.fileSync?.snapshot() ?? []) this.pendingDrafts.set(path, content);
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      if (leaf.view instanceof MarkdownView && leaf.view.file && inSharedFolder(leaf.view.file.path, this.settings.sharedFolder)) {
+        this.pendingDrafts.set(leaf.view.file.path, leaf.view.editor.getValue());
+      }
+    }
     this.ready = false;
     this.hasBeenReady = false;
     this.unsubscribeStatus?.();
@@ -178,12 +337,16 @@ export default class LiveEditPlugin extends Plugin {
       this.connection.awareness.off("change", this.awarenessChangeHandler);
       this.awarenessChangeHandler = null;
     }
-    this.connection.destroy();
-    this.connection = null;
+    const connection = this.connection;
+    this.session = null;
+    this.nudgeOpenEditors();
     this.fileSync?.destroy();
+    connection.destroy();
+    this.connection = null;
     this.fileSync = null;
     this.session = null;
     this.statusBar.render("disconnected", 0, this.settings.role);
+    this.notifyConnection();
   }
 
   async checkServerHealth(): Promise<void> {
@@ -197,7 +360,7 @@ export default class LiveEditPlugin extends Plugin {
 
     new Notice(`LiveEdit: ${url} 확인 중…`);
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = (await response.json()) as { ok: boolean; rooms: number };
       new Notice(`LiveEdit: 서버 정상 동작 중 (열린 방 ${data.rooms}개)`);
@@ -213,6 +376,7 @@ export default class LiveEditPlugin extends Plugin {
       this.app,
       this.connection?.awareness ?? null,
       this.connection?.doc.clientID ?? null,
+      this.connection,
     ).open();
   }
 
@@ -222,7 +386,10 @@ export default class LiveEditPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+    this.notifyConnection();
+    this.nudgeOpenEditors();
     if (this.connection) {
+      this.connection.setAutoReconnect(this.settings.autoReconnect);
       this.connection.awareness.setLocalStateField("user", {
         name: this.settings.displayName.trim() || "익명",
         color: this.settings.color,

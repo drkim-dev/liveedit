@@ -1,6 +1,7 @@
 import { App, Modal } from "obsidian";
 import type { Awareness } from "y-protocols/awareness";
 import type { ConnectionStatus } from "./connection";
+import type { LiveEditConnection } from "./connection";
 
 export interface Participant {
   clientId: number;
@@ -30,6 +31,7 @@ export class ParticipantsModal extends Modal {
     app: App,
     private readonly awareness: Awareness | null,
     private readonly localClientId: number | null,
+    private readonly connection: LiveEditConnection | null = null,
   ) {
     super(app);
   }
@@ -45,6 +47,15 @@ export class ParticipantsModal extends Modal {
     }
 
     const participants = getParticipants(this.awareness, this.localClientId);
+    const state = this.connection?.roomState;
+    if (state?.host) {
+      const button = contentEl.createEl("button", { text: state.locked ? "신규 입장 허용" : "신규 입장 잠금" });
+      button.onclick = () => {
+        this.connection?.control("lock", !state.locked);
+        button.disabled = true;
+        button.setText("요청됨 · 목록을 다시 열어 확인하세요");
+      };
+    }
     if (participants.length === 0) {
       contentEl.createEl("p", { text: "아직 다른 참여자가 없습니다." });
       return;
@@ -56,6 +67,16 @@ export class ParticipantsModal extends Modal {
       const dot = row.createSpan({ cls: "liveedit-color-dot" });
       dot.style.backgroundColor = participant.color;
       row.createSpan({ text: participant.name });
+      const peer = state?.peers.find((peer) => peer.clientIds.includes(participant.clientId));
+      if (peer?.host) row.createSpan({ text: " (방장)" });
+      if (state?.host && peer && !peer.host) {
+        const kick = row.createEl("button", { text: "퇴장" });
+        kick.onclick = () => {
+          this.connection?.control("kick", peer.id);
+          kick.disabled = true;
+          kick.setText("퇴장 요청됨");
+        };
+      }
       if (participant.file) {
         row.createSpan({ cls: "liveedit-participant-file", text: participant.file });
       }
@@ -69,12 +90,14 @@ export class ParticipantsModal extends Modal {
 
 const STATUS_LABEL: Record<ConnectionStatus, string> = {
   connecting: "연결 중…",
+  syncing: "최신 문서 받는 중 · 읽기 전용",
   connected: "연결됨",
-  disconnected: "연결 안 됨",
+  disconnected: "연결 안 됨 · 공유 폴더 읽기 전용",
 };
 
 const STATUS_ICON: Record<ConnectionStatus, string> = {
   connecting: "🟡",
+  syncing: "🟡",
   connected: "🟢",
   disconnected: "⚪",
 };
