@@ -45,7 +45,8 @@
 .liveedit-color-dot { flex-shrink: 0; }
 
 /* Keep the native filename and its drag/rename target intact. */
-.nav-file-title > .liveedit-file-presence {
+.nav-file-title > .liveedit-file-presence,
+.nav-folder-title > .liveedit-file-presence {
   display: inline-flex;
   align-items: center;
   gap: 5px;

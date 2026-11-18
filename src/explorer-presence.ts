@@ -53,26 +53,46 @@ export class FileExplorerPresence {
         // Observe only explorer panes, including lazy-rendered and renamed rows.
         const Observer = root.ownerDocument.defaultView!.MutationObserver;
         const observer = new Observer(() => this.schedule());
-        observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ["data-path"] });
+        observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ["data-path", "class", "aria-expanded"] });
         this.observers.set(root, observer);
       }
+      const folders = Array.from(root.querySelectorAll<HTMLElement>(".nav-folder-title[data-path]"));
+      const collapsed = folders.filter((row) => row.closest(".nav-folder")?.classList.contains("is-collapsed") ||
+        row.getAttribute("aria-expanded") === "false")
+        .map((row) => row.getAttribute("data-path") ?? "")
+        .filter(Boolean).sort((a, b) => a.length - b.length);
+      const hiddenBy = (path: string): string | undefined => collapsed.find((folder) => path.startsWith(folder + "/"));
+      const byFolder = new Map<string, Map<number, Participant>>();
+      // Use paths, not rendered child nodes: a collapsed subtree may not exist in the DOM.
+      for (const [path, participants] of byFile) {
+        const folder = hiddenBy(path);
+        if (!folder) continue;
+        const occupants = byFolder.get(folder) ?? new Map<number, Participant>();
+        for (const person of participants) occupants.set(person.clientId, person);
+        byFolder.set(folder, occupants);
+      }
       for (const row of Array.from(root.querySelectorAll<HTMLElement>(".nav-file-title[data-path]"))) {
-        this.decorate(row, byFile.get(row.getAttribute("data-path") ?? "") ?? []);
+        const path = row.getAttribute("data-path") ?? "";
+        this.decorate(row, hiddenBy(path) ? [] : byFile.get(path) ?? []);
+      }
+      for (const row of folders) {
+        const occupants = byFolder.get(row.getAttribute("data-path") ?? "");
+        this.decorate(row, occupants ? Array.from(occupants.values()) : [], true);
       }
     }
   }
 
-  private decorate(row: HTMLElement, participants: Participant[]): void {
+  private decorate(row: HTMLElement, participants: Participant[], showFile = false): void {
     let badge = Array.from(row.children).find((child) => child.classList.contains("liveedit-file-presence")) as HTMLElement | undefined;
     if (!participants.length) {
       if (badge) { this.badges.delete(badge); badge.remove(); }
       return;
     }
     const label = participants.map((person) =>
-      `${person.name}${person.self ? " (나)" : ""}`,
+      `${person.name}${person.self ? " (나)" : ""}${showFile && person.file ? ` · ${person.file}` : ""}`,
     ).join("\n");
-    const signature = JSON.stringify(participants.map(({ clientId, name, color, self }) =>
-      [clientId, name, color, self]));
+    const signature = JSON.stringify([label, participants.map(({ clientId, name, color, self }) =>
+      [clientId, name, color, self])]);
     if (badge?.dataset.presence === signature) return;
     if (!badge) {
       badge = row.ownerDocument.createElement("span");
