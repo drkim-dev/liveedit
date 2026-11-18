@@ -129,3 +129,51 @@ test("file explorer shows note occupants inline and preserves native rows across
   assert.equal(listeners.size, 0);
   assert.equal(roots.reduce((count, root) => count + root.querySelectorAll(".liveedit-file-presence").length, 0), 0);
 });
+
+
+test("collapsed folders collect hidden note occupants at the outermost closed ancestor", async () => {
+  const root = document.createElement("div");
+  root.innerHTML = `<div class="nav-folder"><div class="nav-folder-title" data-path="Team">Team</div><div class="nav-folder-children"><div class="nav-folder"><div class="nav-folder-title" data-path="Team/Sub">Sub</div><div class="nav-folder-children"><div class="nav-file-title" data-path="Team/Sub/a.md">a.md</div></div></div><div class="nav-file-title" data-path="Team/b.md">b.md</div></div></div><div class="nav-folder is-collapsed"><div class="nav-folder-title" data-path="Team2">Team2</div></div>`;
+  const rows = [...root.querySelectorAll(".nav-folder-title")];
+  const [team, sub, unrelated] = rows;
+  const a = root.querySelector('[data-path="Team/Sub/a.md"]');
+  const b = root.querySelector('[data-path="Team/b.md"]');
+  const states = new Map([[11, { viewingFile: "Team/Sub/a.md" }], [22, { viewingFile: "Team/b.md" }], [33, { viewingFile: "Team/Sub/lazy.md" }]]);
+  const connection = { status: "connected", doc: { clientID: 11 }, awareness: { getStates: () => states }, roomState: {
+    peers: [11, 22, 33].map((id) => ({ id: String(id), clientIds: [id], name: `User${id}`, color: "#1971c2", host: false })),
+  } };
+  const listeners = new Set();
+  const source = { getPresenceConnection: () => connection, getConnectionStatus: () => connection.status,
+    onConnectionChange: (callback) => { listeners.add(callback); return () => listeners.delete(callback); } };
+  const app = { workspace: { getLeavesOfType: () => [{ view: { containerEl: root } }] } };
+  const badge = (row) => row.querySelector(".liveedit-file-presence");
+  const display = new FileExplorerPresence(app, source);
+  try {
+    assert.ok(badge(a)); assert.ok(badge(b)); assert.equal(badge(team), null);
+    sub.parentElement.classList.add("is-collapsed");
+    await new Promise((resolve) => window.setTimeout(resolve, 120));
+    assert.equal(badge(a), null); assert.ok(badge(b));
+    assert.match(badge(sub).title, /User11.*Team\/Sub\/a.md/);
+    assert.match(badge(sub).title, /User33.*lazy.md/, "unrendered descendants count too");
+    team.parentElement.classList.add("is-collapsed");
+    await new Promise((resolve) => window.setTimeout(resolve, 120));
+    assert.equal(badge(sub), null); assert.equal(badge(b), null);
+    assert.match(badge(team).title, /User11/); assert.match(badge(team).title, /User22/); assert.match(badge(team).title, /User33/);
+    assert.match(badge(team).textContent, /\+1/); assert.equal(badge(unrelated), null);
+    team.parentElement.classList.remove("is-collapsed"); display.refresh();
+    assert.equal(badge(team), null); assert.ok(badge(sub)); assert.ok(badge(b));
+    // Some trees expose collapsed state as aria-expanded on the title.
+    sub.parentElement.classList.remove("is-collapsed"); sub.setAttribute("aria-expanded", "false"); display.refresh();
+    assert.ok(badge(sub));
+    sub.setAttribute("aria-expanded", "true"); display.refresh();
+    assert.equal(badge(sub), null); assert.ok(badge(a));
+    team.parentElement.classList.add("is-collapsed"); display.refresh();
+    states.get(11).viewingFile = "Team2/moved.md"; display.refresh();
+    assert.doesNotMatch(badge(team).title, /User11/); assert.match(badge(unrelated).title, /User11/);
+    states.delete(22); connection.roomState.peers = connection.roomState.peers.filter((p) => p.clientIds[0] !== 22); display.refresh();
+    assert.doesNotMatch(badge(team).title, /User22/);
+    connection.status = "disconnected"; display.refresh();
+    assert.equal(root.querySelectorAll(".liveedit-file-presence").length, 0);
+  } finally { display.destroy(); }
+  assert.equal(listeners.size, 0);
+});
