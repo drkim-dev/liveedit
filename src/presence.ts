@@ -90,9 +90,9 @@ export class ParticipantsModal extends Modal {
 
 const STATUS_LABEL: Record<ConnectionStatus, string> = {
   connecting: "연결 중…",
-  syncing: "최신 문서 받는 중 · 읽기 전용",
+  syncing: "최신 문서 받는 중 · 볼트 읽기 전용",
   connected: "연결됨",
-  disconnected: "연결 안 됨 · 공유 폴더 읽기 전용",
+  disconnected: "연결 안 됨 · 볼트 읽기 전용",
 };
 
 const STATUS_ICON: Record<ConnectionStatus, string> = {

@@ -10,6 +10,7 @@ export interface LiveEditSettings {
   room: string;
   displayName: string;
   color: string;
+  /** Legacy migration marker only; 0.5.2 always shares this vault. */
   sharedFolder: string;
   autoReconnect: boolean;
 }
@@ -95,7 +96,7 @@ export class LiveEditSettingTab extends PluginSettingTab {
     };
     new Setting(containerEl)
       .setName("세션 접속")
-      .setDesc("참여자는 재접속할 때 로컬 사본을 보관하고 공용 문서의 내용·파일 목록을 받아옵니다.")
+      .setDesc("이 볼트의 노트를 함께 편집합니다. 연결 및 최신 동기화 완료 전에는 읽기 전용입니다. 개인 노트는 다른 볼트를 사용하세요.")
       .addButton((button) => {
         connectButton = button;
         button.setCta().onClick(async () => {
@@ -202,21 +203,6 @@ export class LiveEditSettingTab extends PluginSettingTab {
         }),
       );
 
-    containerEl.createEl("h3", { text: "동기화 범위" });
-
-    new Setting(containerEl)
-      .setName("공유 폴더")
-      .setDesc("필수 항목입니다. 이 폴더는 연결이 끊기거나 동기화 중이면 읽기 전용입니다. 개인 노트는 폴더 밖에 두세요 (예: Team).")
-      .addText((text) =>
-        text
-          .setPlaceholder("예: Team (필수)")
-          .setValue(this.plugin.settings.sharedFolder)
-          .onChange(async (value) => {
-            this.plugin.settings.sharedFolder = value.trim().replace(/^\/+|\/+$/g, "");
-            await this.plugin.saveSettings();
-            this.disconnectIfLive("공유 폴더");
-          }),
-      );
   }
 
   hide(): void {

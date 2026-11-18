@@ -93,6 +93,8 @@ export class FileSync {
     await this.settled(true);
   }
 
+  async importLocalNotes(): Promise<void> { await this.seedFromVault(); }
+
   private addText(path: string, content: string): Y.Text {
     const id = this.files.has(path) ? `${this.files.doc!.clientID}:${Date.now()}:${++this.backupSequence}` : path;
     const text = new Y.Text(content);

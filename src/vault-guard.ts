@@ -25,7 +25,7 @@ export class VaultGuard {
         const destination = method === "rename" || method === "copy" ? pathOf(args[1]) : "";
         const mutatesSource = method !== "copy";
         if (this.active && !editable() && ((mutatesSource && affects(source, ["delete", "trash", "rename"].includes(method))) || affects(destination))) {
-          const message = "LiveEdit: 공유 폴더는 연결 및 최신 동기화 완료 후 변경할 수 있습니다. 개인 노트를 사용해주세요.";
+          const message = "LiveEdit: 이 볼트는 연결 및 최신 동기화 완료 후 편집할 수 있습니다. 개인 작업은 다른 볼트를 사용해주세요.";
           new Notice(message);
           throw new Error(message);
         }
