@@ -11,9 +11,11 @@ const MSG_CONTROL = 2;
 export interface RoomState {
   protocol: number;
   lifecycle?: number;
+  presence?: number;
+  selfId?: string;
   host: boolean;
   locked: boolean;
-  peers: { id: string; host: boolean; clientIds: number[] }[];
+  peers: { id: string; host: boolean; name: string; color: string; clientIds: number[] }[];
 }
 
 export type ConnectionStatus = "connecting" | "syncing" | "connected" | "disconnected";
@@ -57,6 +59,11 @@ export class LiveEditConnection {
   private attempts = 0;
   roomState: RoomState | null = null;
   lastError = "";
+  private readonly roomListeners = new Set<() => void>();
+  onRoomStateChange(callback: () => void): () => void {
+    this.roomListeners.add(callback);
+    return () => this.roomListeners.delete(callback);
+  }
   private readonly syncedListeners = new Set<() => void>();
   private generation = 0;
   private opened = false;
@@ -155,6 +162,7 @@ export class LiveEditConnection {
     this.synced = false;
     this.ws?.close();
     this.ws = null;
+    this.roomState = null;
     this.clearRemoteAwareness();
     this.setStatus("disconnected");
   }
@@ -191,7 +199,10 @@ export class LiveEditConnection {
     }
     if (generation !== this.generation) return;
     this.opened = true;
-    const ws = new WebSocket(this.url);
+    const address = new URL(this.url);
+    address.searchParams.set("name", this.awareness.getLocalState()?.user?.name ?? "");
+    address.searchParams.set("clientId", String(this.doc.clientID));
+    const ws = new WebSocket(address.toString());
     ws.binaryType = "arraybuffer";
     this.ws = ws;
     this.connectTimeout = window.setTimeout(() => ws.close(), 10000);
@@ -232,7 +243,7 @@ export class LiveEditConnection {
       this.synced = false;
       this.roomState = null;
       this.lastError = event.reason || `서버 연결 실패 (${event.code}). 방장은 서버가 켜져 있는지 확인해주세요.`;
-      if ([4001, 4003, 4004, 4005].includes(event.code)) this.shouldReconnect = false;
+      if ([4001, 4003, 4004, 4005, 4009].includes(event.code)) this.shouldReconnect = false;
       this.setStatus("disconnected");
       this.clearRemoteAwareness();
       if (this.shouldReconnect) {
@@ -275,6 +286,12 @@ export class LiveEditConnection {
       awarenessProtocol.applyAwarenessUpdate(this.awareness, decoding.readVarUint8Array(decoder), "remote");
     } else if (type === MSG_CONTROL) {
       this.roomState = JSON.parse(decoding.readVarString(decoder)) as RoomState;
+      const self = this.roomState.peers.find((peer) => peer.id === this.roomState?.selfId);
+      const user = this.awareness.getLocalState()?.user;
+      if (self && (user?.name !== self.name || user?.color !== self.color)) {
+        this.awareness.setLocalStateField("user", { name: self.name, color: self.color });
+      }
+      for (const callback of this.roomListeners) callback();
     } else if (type === 3) {
       this.send(new Uint8Array([3]));
     }
@@ -289,6 +306,7 @@ export class LiveEditConnection {
   }
 
   private sendAwareness(ids: number[]): void {
+    ids = ids.filter((id) => id === this.doc.clientID);
     if (ids.length === 0) return;
     const encoder = encoding.createEncoder();
     encoding.writeVarUint(encoder, MSG_AWARENESS);

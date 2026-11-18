@@ -32,6 +32,10 @@ export const DEFAULT_SETTINGS: LiveEditSettings = {
   autoReconnect: true,
 };
 
+export function validDisplayName(value: string): boolean {
+  return !!value.trim() && value.trim().length <= 40 && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
 export class LiveEditSettingTab extends PluginSettingTab {
   private unsubscribeConnection: (() => void) | null = null;
   private everConnected = false;
@@ -50,7 +54,7 @@ export class LiveEditSettingTab extends PluginSettingTab {
     if (!this.plugin.isConnected()) return;
     this.plugin.disconnect();
     new Notice(
-      `LiveEdit: ${fieldLabel}가 변경되어 연결을 끊었습니다. 확인 후 '세션 연결'로 다시 접속해주세요.`,
+      `LiveEdit: ${fieldLabel}가 변경되어 연결을 끊었습니다. 확인 후 '접속 버튼'로 다시 접속해주세요.`,
       8000,
     );
   }
@@ -94,9 +98,19 @@ export class LiveEditSettingTab extends PluginSettingTab {
       connectionSetting?.setDesc(this.plugin.getConnectionMessage?.() || connectionDescription);
       if (status === "connected") this.everConnected = true;
       connectButton.setButtonText(status === "syncing" ? "최신 문서 받는 중…" : status === "connecting" ? (isHost ? "방 여는 중…" : "연결 중…") : isHost ? (status === "connected" ? "방 열림" : "방 개설하기") : this.everConnected || this.plugin.isConnected() ? "재접속" : "참여하기");
-      connectButton.setDisabled(status === "connecting" || status === "syncing" || (isHost && status === "connected"));
+      connectButton.setDisabled(!validDisplayName(this.plugin.settings.displayName) || status === "connecting" || status === "syncing" || (isHost && status === "connected"));
       disconnectButton.setDisabled(!this.plugin.isConnected());
     };
+    new Setting(containerEl)
+      .setName("이름 (필수)")
+      .setDesc("1~40자. 이름을 입력해야 접속할 수 있습니다. 색상은 자동으로 배정됩니다.")
+      .addText((text) => text.setPlaceholder("이름을 입력하세요")
+        .setValue(this.plugin.settings.displayName).onChange(async (value) => {
+          this.plugin.settings.displayName = value.trim();
+          this.disconnectIfLive("이름");
+          await this.plugin.saveSettings();
+          updateButtons();
+        }));
     connectionSetting = new Setting(containerEl)
       .setName(isHost ? "방 개설" : "방 참여")
       .setDesc(connectionDescription)
@@ -149,30 +163,6 @@ export class LiveEditSettingTab extends PluginSettingTab {
         }),
       );
 
-    containerEl.createEl("h3", { text: "표시" });
-
-    new Setting(containerEl)
-      .setName("표시 이름")
-      .setDesc("팀원들에게 보여질 이름")
-      .addText((text) =>
-        text
-          .setPlaceholder("이름")
-          .setValue(this.plugin.settings.displayName)
-          .onChange(async (value) => {
-            this.plugin.settings.displayName = value.trim();
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("커서 색상")
-      .setDesc("내 커서와 참여자 목록에 표시되는 색상")
-      .addColorPicker((picker) =>
-        picker.setValue(this.plugin.settings.color).onChange(async (value) => {
-          this.plugin.settings.color = value;
-          await this.plugin.saveSettings();
-        }),
-      );
 
   }
 

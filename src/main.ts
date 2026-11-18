@@ -2,8 +2,8 @@ import { MarkdownView, Notice, Plugin } from "obsidian";
 import { buildHealthUrl, buildRoomUrl, ConnectionStatus, LiveEditConnection } from "./connection";
 import { createLiveEditExtension, ActiveSession } from "./editor-binding";
 import { FileSync } from "./file-sync";
-import { ParticipantsModal, StatusBarWidget } from "./presence";
-import { DEFAULT_SETTINGS, LiveEditSettings, LiveEditSettingTab } from "./settings";
+import { ParticipantsModal, ParticipantsView, PARTICIPANTS_VIEW, StatusBarWidget } from "./presence";
+import { DEFAULT_SETTINGS, LiveEditSettings, LiveEditSettingTab, validDisplayName } from "./settings";
 import { inSharedFolder } from "./shared-scope";
 import { VaultGuard } from "./vault-guard";
 
@@ -31,6 +31,9 @@ export default class LiveEditPlugin extends Plugin {
   private unsubscribeStatus: (() => void) | null = null;
   private awarenessChangeHandler: (() => void) | null = null;
   private readonly connectionListeners = new Set<() => void>();
+  private unsubscribeRoom: (() => void) | null = null;
+  private activityTimer: number | null = null;
+  private pendingActivity: { path: string | null; line: number | null; editingUntil: number } | null = null;
   private reconnecting = false;
   private pendingDrafts = new Map<string, string>();
   private vaultGuard: VaultGuard | null = null;
@@ -75,7 +78,7 @@ export default class LiveEditPlugin extends Plugin {
   }
 
   async reconnect(): Promise<void> {
-    if (this.reconnecting) return;
+    if (!this.requireName() || this.reconnecting) return;
     this.reconnecting = true;
     try {
       if (this.settings.role === "host" && this.connection) {
@@ -104,10 +107,17 @@ export default class LiveEditPlugin extends Plugin {
     this.registerDomEvent(statusBarEl, "click", () => this.showParticipants());
 
     this.addSettingTab(new LiveEditSettingTab(this.app, this));
+    this.registerView(PARTICIPANTS_VIEW, (leaf) => new ParticipantsView(leaf, this));
+    this.addRibbonIcon("users", "LiveEdit 참여 위치", () => { void this.showParticipantsSidebar(); });
+    this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.updateActiveNote()));
+    this.registerEvent(this.app.workspace.on("file-open", () => this.updateActiveNote()));
+    this.registerEvent(this.app.vault.on("rename", () => this.updateActiveNote()));
+    this.registerEvent(this.app.vault.on("delete", () => this.updateActiveNote()));
 
     this.registerEditorExtension(
       createLiveEditExtension({
         getSession: () => this.getSession(),
+        onActivity: (path, line, editing) => this.publishActivity(path, line, editing),
         isReadOnlyPath: (path) => this.isReadOnlyPath(path),
         onAccessChange: (callback) => this.onConnectionChange(callback),
       }),
@@ -139,7 +149,7 @@ export default class LiveEditPlugin extends Plugin {
       callback: () => this.checkServerHealth(),
     });
 
-    if (this.settings.autoReconnect && this.settings.role === "member") {
+    if (this.settings.autoReconnect && this.settings.role === "member" && validDisplayName(this.settings.displayName)) {
       // Connect on startup if the user was previously using auto-reconnect.
       this.connect();
     }
@@ -160,7 +170,16 @@ export default class LiveEditPlugin extends Plugin {
     return this.session;
   }
 
+  private requireName(): boolean {
+    if (validDisplayName(this.settings.displayName)) return true;
+    this.connectionMessage = "이름을 먼저 입력해주세요 (1~40자).";
+    this.notifyConnection();
+    new Notice(`LiveEdit: ${this.connectionMessage}`);
+    return false;
+  }
+
   async connect(): Promise<void> {
+    if (!this.requireName()) return;
     this.installVaultGuard();
     if (this.connection) {
       if (this.connection.status === "disconnected") { await this.reconnect(); return; }
@@ -197,7 +216,7 @@ export default class LiveEditPlugin extends Plugin {
     let initialization: Promise<void> = Promise.resolve();
 
     const refreshStatusBar = (): void => {
-      const remoteCount = connection.awareness.getStates().size - 1;
+      const remoteCount = (connection.roomState?.peers.length ?? connection.awareness.getStates().size) - 1;
       this.statusBar.render(this.getConnectionStatus(), Math.max(0, remoteCount), this.settings.role);
       this.notifyConnection();
     };
@@ -210,6 +229,7 @@ export default class LiveEditPlugin extends Plugin {
     const initialize = async (): Promise<void> => {
       if (this.connection !== connection) return;
       if (connection.roomState?.protocol !== 2) throw new Error("릴레이 서버를 0.5.0 이상으로 업데이트해주세요.");
+      if (connection.roomState.presence !== 1) throw new Error("참여 위치 기능을 사용하려면 서버도 0.7.0으로 교체해주세요.");
       if (connection.roomState.lifecycle !== 1) throw new Error("방 개설 기능을 사용하려면 서버도 0.6.0으로 교체해주세요.");
       if (isHost && !connection.roomState.host) throw new Error("서버를 실행한 PC에서 방 개설하기를 눌러주세요.");
       if (isHost && this.session && this.fileSync) {
@@ -249,6 +269,8 @@ export default class LiveEditPlugin extends Plugin {
       this.session = { awareness: connection.awareness, fileSync: sync };
       this.ready = true;
       this.hasBeenReady = true;
+      this.updateActiveNote();
+      void this.showParticipantsSidebar(false);
       this.nudgeOpenEditors();
       refreshStatusBar();
     };
@@ -287,6 +309,7 @@ export default class LiveEditPlugin extends Plugin {
     this.awarenessChangeHandler = refreshStatusBar;
     connection.awareness.on("change", refreshStatusBar);
     this.unsubscribeStatus = connection.onStatusChange(handleStatusChange);
+    this.unsubscribeRoom = connection.onRoomStateChange(refreshStatusBar);
     refreshStatusBar();
 
     connection.connect();
@@ -342,6 +365,11 @@ export default class LiveEditPlugin extends Plugin {
     }
     this.ready = false;
     this.hasBeenReady = false;
+    if (this.activityTimer !== null) window.clearTimeout(this.activityTimer);
+    this.activityTimer = null;
+    this.pendingActivity = null;
+    this.unsubscribeRoom?.();
+    this.unsubscribeRoom = null;
     this.unsubscribeStatus?.();
     this.unsubscribeStatus = null;
     if (this.awarenessChangeHandler) {
@@ -382,13 +410,45 @@ export default class LiveEditPlugin extends Plugin {
     }
   }
 
-  showParticipants(): void {
-    new ParticipantsModal(
-      this.app,
-      this.connection?.awareness ?? null,
-      this.connection?.doc.clientID ?? null,
-      this.connection,
-    ).open();
+  getPresenceConnection(): LiveEditConnection | null { return this.connection; }
+
+  showParticipants(): void { new ParticipantsModal(this.app, this).open(); }
+
+  async showParticipantsSidebar(reveal = true): Promise<void> {
+    let leaf = this.app.workspace.getLeavesOfType(PARTICIPANTS_VIEW)[0];
+    if (!leaf) {
+      leaf = this.app.workspace.getLeftLeaf(false)!;
+      if (!leaf) return;
+      await leaf.setViewState({ type: PARTICIPANTS_VIEW, active: reveal });
+    }
+    if (reveal) await this.app.workspace.revealLeaf(leaf);
+  }
+
+  private updateActiveNote(): void {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const path = view?.file?.path ?? this.app.workspace.getActiveFile()?.path ?? null;
+    this.publishActivity(path, view ? view.editor.getCursor().line + 1 : null, false);
+  }
+
+  private publishActivity(path: string | null, line: number | null, editing: boolean): void {
+    if (!this.connection || this.connection.status !== "connected") return;
+    const validPath = path && inSharedFolder(path, "") && this.app.vault.getAbstractFileByPath(path) ? path : null;
+    const local = this.connection.awareness.getLocalState();
+    const previousPath = this.pendingActivity ? this.pendingActivity.path : local?.viewingFile;
+    const previousUntil = this.pendingActivity ? this.pendingActivity.editingUntil : local?.editingUntil;
+    this.pendingActivity = {
+      path: validPath, line: validPath ? line : null,
+      editingUntil: editing ? Date.now() + 4000 : previousPath === validPath ? previousUntil ?? 0 : 0,
+    };
+    if (this.activityTimer !== null) return;
+    this.activityTimer = window.setTimeout(() => {
+      this.activityTimer = null;
+      const activity = this.pendingActivity;
+      this.pendingActivity = null;
+      if (!activity || this.connection?.status !== "connected") return;
+      const state = this.connection.awareness.getLocalState();
+      this.connection.awareness.setLocalState({ ...state, viewingFile: activity.path, line: activity.line, editingUntil: activity.editingUntil });
+    }, 100);
   }
 
   async loadSettings(): Promise<void> {
@@ -402,10 +462,7 @@ export default class LiveEditPlugin extends Plugin {
     this.nudgeOpenEditors();
     if (this.connection) {
       this.connection.setAutoReconnect(this.settings.autoReconnect);
-      this.connection.awareness.setLocalStateField("user", {
-        name: this.settings.displayName.trim() || "익명",
-        color: this.settings.color,
-      });
+
     }
   }
 }

@@ -22,6 +22,7 @@ export interface ActiveSession {
 
 export interface EditorBindingDeps {
   getSession: () => ActiveSession | null;
+  onActivity?: (path: string | null, line: number, editing: boolean) => void;
   isReadOnlyPath?: (path: string) => boolean;
   onAccessChange?: (callback: () => void) => () => void;
 }
@@ -119,6 +120,12 @@ export function createLiveEditExtension(deps: EditorBindingDeps): Extension {
 
         update(update: ViewUpdate): void {
           this.check(update.view);
+          if (update.view.hasFocus && (update.docChanged || update.selectionSet || update.focusChanged)) {
+            const path = update.state.field(editorInfoField, false)?.file?.path ?? null;
+            const editing = update.transactions.some((transaction) => transaction.docChanged &&
+              ["input", "delete", "undo", "redo"].some((event) => transaction.isUserEvent(event)));
+            deps.onActivity?.(path, update.state.doc.lineAt(update.state.selection.main.head).number, editing);
+          }
         }
 
         destroy(): void {
