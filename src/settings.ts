@@ -1,10 +1,11 @@
-import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, PluginSettingTab, Setting, ButtonComponent } from "obsidian";
 import type LiveEditPlugin from "./main";
 
 export type Role = "host" | "member";
 
 export interface LiveEditSettings {
   role: Role;
+  hostToken: string;
   serverUrl: string;
   room: string;
   displayName: string;
@@ -21,6 +22,7 @@ export function randomColor(): string {
 
 export const DEFAULT_SETTINGS: LiveEditSettings = {
   role: "member",
+  hostToken: "",
   serverUrl: "ws://localhost:1234",
   room: "team",
   displayName: "",
@@ -30,6 +32,8 @@ export const DEFAULT_SETTINGS: LiveEditSettings = {
 };
 
 export class LiveEditSettingTab extends PluginSettingTab {
+  private unsubscribeConnection: (() => void) | null = null;
+  private everConnected = false;
   constructor(app: App, private plugin: LiveEditPlugin) {
     super(app, plugin);
   }
@@ -51,6 +55,7 @@ export class LiveEditSettingTab extends PluginSettingTab {
   }
 
   display(): void {
+    this.unsubscribeConnection?.();
     const { containerEl } = this;
     containerEl.empty();
     const isHost = this.plugin.settings.role === "host";
@@ -61,7 +66,7 @@ export class LiveEditSettingTab extends PluginSettingTab {
       .setName("이 PC의 역할")
       .setDesc(
         isHost
-          ? "방장: server/ 폴더의 릴레이 서버를 이 PC(또는 팀 상시 서버)에서 계속 켜두고, Obsidian도 함께 켜둔 상태로 팀원과 같이 편집합니다."
+          ? "방장: 서버 인증 키로 접속해 참여자 퇴장과 신규 입장 잠금을 관리합니다. 새 방의 초기 문서는 방장의 공유 폴더에서 가져옵니다."
           : "참여자: 방장이 켜둔 릴레이 서버 주소로 접속만 하면 됩니다. 별도로 서버를 실행할 필요가 없습니다.",
       )
       .addDropdown((dropdown) =>
@@ -72,11 +77,52 @@ export class LiveEditSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.role = value as Role;
             await this.plugin.saveSettings();
+            this.disconnectIfLive("역할");
             this.display(); // redraw — labels/hints below depend on the role
           }),
       );
 
     containerEl.createEl("h3", { text: "연결" });
+
+    let connectButton: ButtonComponent;
+    let disconnectButton: ButtonComponent;
+    const updateButtons = (): void => {
+      const status = this.plugin.getConnectionStatus();
+      if (status === "connected") this.everConnected = true;
+      connectButton.setButtonText(status === "connected" ? "재접속" : status === "syncing" ? "최신 문서 받는 중…" : status === "connecting" ? "연결 중…" : this.everConnected || this.plugin.isConnected() ? "재접속" : "접속");
+      connectButton.setDisabled(status === "connecting" || status === "syncing");
+      disconnectButton.setDisabled(!this.plugin.isConnected());
+    };
+    new Setting(containerEl)
+      .setName("세션 접속")
+      .setDesc("참여자는 재접속할 때 로컬 사본을 보관하고 공용 문서의 내용·파일 목록을 받아옵니다.")
+      .addButton((button) => {
+        connectButton = button;
+        button.setCta().onClick(async () => {
+          button.setDisabled(true);
+          try { await this.plugin.reconnect(); } finally { updateButtons(); }
+        });
+      })
+      .addButton((button) => {
+        disconnectButton = button;
+        button.setButtonText("연결 해제").onClick(() => this.plugin.disconnect());
+      });
+    updateButtons();
+    this.unsubscribeConnection = this.plugin.onConnectionChange(updateButtons);
+
+    if (isHost) {
+      new Setting(containerEl)
+        .setName("방장 인증 키")
+        .setDesc("서버의 LIVEEDIT_HOST_TOKEN과 같은 값. 참여자에게 공유하지 마세요. 이 기기의 플러그인 설정에 저장됩니다.")
+        .addText((text) => {
+          text.inputEl.type = "password";
+          text.setValue(this.plugin.settings.hostToken).onChange(async (value) => {
+            this.plugin.settings.hostToken = value;
+            await this.plugin.saveSettings();
+            this.disconnectIfLive("방장 인증 키");
+          });
+        });
+    }
 
     const serverSetting = new Setting(containerEl)
       .setName("릴레이 서버 주소")
@@ -160,15 +206,21 @@ export class LiveEditSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("공유 폴더")
-      .setDesc("비워두면 vault 전체를 공유합니다. 특정 폴더만 공유하려면 경로를 입력하세요 (예: Team).")
+      .setDesc("필수 항목입니다. 이 폴더는 연결이 끊기거나 동기화 중이면 읽기 전용입니다. 개인 노트는 폴더 밖에 두세요 (예: Team).")
       .addText((text) =>
         text
-          .setPlaceholder("전체 vault")
+          .setPlaceholder("예: Team (필수)")
           .setValue(this.plugin.settings.sharedFolder)
           .onChange(async (value) => {
             this.plugin.settings.sharedFolder = value.trim().replace(/^\/+|\/+$/g, "");
             await this.plugin.saveSettings();
+            this.disconnectIfLive("공유 폴더");
           }),
       );
+  }
+
+  hide(): void {
+    this.unsubscribeConnection?.();
+    this.unsubscribeConnection = null;
   }
 }
