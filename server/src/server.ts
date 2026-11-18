@@ -35,7 +35,7 @@ const httpServer = createServer((req, res) => {
       "content-type": "application/json",
       "access-control-allow-origin": "*",
     });
-    res.end(JSON.stringify({ ok: true, version: "0.6.0", rooms: rooms.size }));
+    res.end(JSON.stringify({ ok: true, version: "0.7.0", rooms: rooms.size }));
     return;
   }
   res.writeHead(404).end();
@@ -77,6 +77,14 @@ httpServer.on("upgrade", (req, socket, head) => {
       ws.close(4001, "방장 인증 키가 올바르지 않습니다");
       return;
     }
+    const name = (url.searchParams.get("name") ?? "").trim();
+    const rawClientId = url.searchParams.get("clientId");
+    const clientId = Number(rawClientId);
+    if (!name || name.length > 40 || /[\u0000-\u001f\u007f]/.test(name) ||
+        !rawClientId || !Number.isSafeInteger(clientId) || clientId < 0 || clientId > 0xffffffff) {
+      ws.close(4009, "이름을 입력하고 LiveEdit 0.7.0으로 접속해주세요");
+      return;
+    }
     let room: Room;
     try { room = getOrCreateRoom(roomName); }
     catch (error) {
@@ -84,7 +92,7 @@ httpServer.on("upgrade", (req, socket, head) => {
       ws.close(1011, "방 데이터를 불러올 수 없습니다");
       return;
     }
-    room.join(ws, host);
+    room.join(ws, host, name, clientId);
 
     ws.on("message", (data, binary) => {
       try {
