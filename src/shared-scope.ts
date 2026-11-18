@@ -1,5 +1,6 @@
 export function inSharedFolder(path: string, folder: string): boolean {
-  return !!folder && (path === folder || path.startsWith(`${folder}/`));
+  if (!path || path.split("/").some((part) => part.startsWith("."))) return false;
+  return !folder || path === folder || path.startsWith(`${folder}/`);
 }
 
 export function validSharedFolder(folder: string): boolean {

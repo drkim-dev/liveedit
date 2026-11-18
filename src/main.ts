@@ -4,7 +4,7 @@ import { createLiveEditExtension, ActiveSession } from "./editor-binding";
 import { FileSync } from "./file-sync";
 import { ParticipantsModal, StatusBarWidget } from "./presence";
 import { DEFAULT_SETTINGS, LiveEditSettings, LiveEditSettingTab } from "./settings";
-import { inSharedFolder, validSharedFolder } from "./shared-scope";
+import { inSharedFolder } from "./shared-scope";
 import { VaultGuard } from "./vault-guard";
 
 export default class LiveEditPlugin extends Plugin {
@@ -34,6 +34,7 @@ export default class LiveEditPlugin extends Plugin {
   private reconnecting = false;
   private pendingDrafts = new Map<string, string>();
   private vaultGuard: VaultGuard | null = null;
+  private importLegacyScope = false;
 
   getConnectionStatus(): ConnectionStatus {
     const status = this.connection?.status ?? "disconnected";
@@ -41,10 +42,10 @@ export default class LiveEditPlugin extends Plugin {
   }
   canEditShared(): boolean { return this.ready && this.connection?.status === "connected"; }
   isReadOnlyPath(path: string): boolean {
-    return inSharedFolder(path, this.settings.sharedFolder) && !this.canEditShared();
+    return inSharedFolder(path, "") && !this.canEditShared();
   }
   private installVaultGuard(): void {
-    if (!this.vaultGuard) this.vaultGuard = new VaultGuard(this.app.vault, () => this.settings.sharedFolder, () => this.canEditShared());
+    if (!this.vaultGuard) this.vaultGuard = new VaultGuard(this.app.vault, () => "", () => this.canEditShared());
   }
   onConnectionChange(callback: () => void): () => void {
     this.connectionListeners.add(callback);
@@ -167,10 +168,6 @@ export default class LiveEditPlugin extends Plugin {
       new Notice("LiveEdit: 방 코드를 설정에서 입력해주세요.");
       return;
     }
-    if (!validSharedFolder(this.settings.sharedFolder)) {
-      new Notice("LiveEdit: 개인 노트와 구분할 공유 폴더를 먼저 지정해주세요. 예: Team");
-      return;
-    }
 
     let url: string;
     try {
@@ -197,7 +194,7 @@ export default class LiveEditPlugin extends Plugin {
       color: this.settings.color,
     });
 
-    const sharedFolder = this.settings.sharedFolder;
+    const sharedFolder = "";
     this.connection = connection;
     let initialization: Promise<void> = Promise.resolve();
 
@@ -235,12 +232,20 @@ export default class LiveEditPlugin extends Plugin {
       }
       this.fileSync = sync;
       await sync.start();
+      if (isHost && this.importLegacyScope) await sync.importLocalNotes();
       await sync.settled(true);
       if (this.connection !== connection || connection.status !== "connected" || this.fileSync !== sync) {
         sync.destroy();
         return;
       }
       this.pendingDrafts = new Map();
+      if (this.importLegacyScope) {
+        this.importLegacyScope = false;
+        this.settings.sharedFolder = "";
+        await this.saveData(this.settings);
+        await sync.settled(true);
+        if (this.connection !== connection || connection.status !== "connected" || this.fileSync !== sync) return;
+      }
       this.session = { awareness: connection.awareness, fileSync: sync };
       this.ready = true;
       this.hasBeenReady = true;
@@ -325,7 +330,7 @@ export default class LiveEditPlugin extends Plugin {
     if (!this.connection) return;
     for (const [path, content] of this.fileSync?.snapshot() ?? []) this.pendingDrafts.set(path, content);
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
-      if (leaf.view instanceof MarkdownView && leaf.view.file && inSharedFolder(leaf.view.file.path, this.settings.sharedFolder)) {
+      if (leaf.view instanceof MarkdownView && leaf.view.file && inSharedFolder(leaf.view.file.path, "")) {
         this.pendingDrafts.set(leaf.view.file.path, leaf.view.editor.getValue());
       }
     }
@@ -382,6 +387,7 @@ export default class LiveEditPlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.importLegacyScope = this.settings.role === "host" && !!this.settings.sharedFolder?.trim();
   }
 
   async saveSettings(): Promise<void> {
