@@ -1,0 +1,8 @@
+node_modules/
+server/node_modules/
+server/dist/
+server/data/
+tests/generated/
+main.js
+*.log
+release/
