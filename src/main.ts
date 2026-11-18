@@ -35,6 +35,9 @@ export default class LiveEditPlugin extends Plugin {
   private pendingDrafts = new Map<string, string>();
   private vaultGuard: VaultGuard | null = null;
   private importLegacyScope = false;
+  private connectionMessage = "";
+
+  getConnectionMessage(): string { return this.connectionMessage; }
 
   getConnectionStatus(): ConnectionStatus {
     const status = this.connection?.status ?? "disconnected";
@@ -136,7 +139,7 @@ export default class LiveEditPlugin extends Plugin {
       callback: () => this.checkServerHealth(),
     });
 
-    if (this.settings.autoReconnect) {
+    if (this.settings.autoReconnect && this.settings.role === "member") {
       // Connect on startup if the user was previously using auto-reconnect.
       this.connect();
     }
@@ -164,22 +167,16 @@ export default class LiveEditPlugin extends Plugin {
       new Notice("LiveEdit: 이미 연결되어 있습니다.");
       return;
     }
-    if (!this.settings.room.trim()) {
-      new Notice("LiveEdit: 방 코드를 설정에서 입력해주세요.");
-      return;
-    }
 
     let url: string;
     try {
-      url = buildRoomUrl(this.settings.serverUrl, this.settings.room);
+      url = buildRoomUrl(this.settings.serverUrl, this.settings.room?.trim() || DEFAULT_SETTINGS.room);
       const parsed = new URL(url);
       parsed.searchParams.delete("hostToken");
+      parsed.searchParams.delete("role");
       if (this.settings.role === "host") {
-        if (!this.settings.hostToken.trim()) {
-          new Notice("LiveEdit: 방장 인증 키를 설정해주세요. 서버의 LIVEEDIT_HOST_TOKEN과 같아야 합니다.");
-          return;
-        }
-        parsed.searchParams.set("hostToken", this.settings.hostToken.trim());
+        parsed.searchParams.set("role", "host");
+        if (this.settings.hostToken?.trim()) parsed.searchParams.set("hostToken", this.settings.hostToken.trim());
       }
       url = parsed.toString();
     } catch {
@@ -188,6 +185,7 @@ export default class LiveEditPlugin extends Plugin {
     }
 
     const isHost = this.settings.role === "host";
+    this.connectionMessage = "";
     const connection = new LiveEditConnection(url, this.settings.autoReconnect, !isHost);
     connection.awareness.setLocalStateField("user", {
       name: this.settings.displayName.trim() || "익명",
@@ -212,6 +210,8 @@ export default class LiveEditPlugin extends Plugin {
     const initialize = async (): Promise<void> => {
       if (this.connection !== connection) return;
       if (connection.roomState?.protocol !== 2) throw new Error("릴레이 서버를 0.5.0 이상으로 업데이트해주세요.");
+      if (connection.roomState.lifecycle !== 1) throw new Error("방 개설 기능을 사용하려면 서버도 0.6.0으로 교체해주세요.");
+      if (isHost && !connection.roomState.host) throw new Error("서버를 실행한 PC에서 방 개설하기를 눌러주세요.");
       if (isHost && this.session && this.fileSync) {
         await Promise.resolve();
         await this.fileSync.resynchronize();
@@ -254,7 +254,9 @@ export default class LiveEditPlugin extends Plugin {
     };
 
     const handleStatusChange = (status: ConnectionStatus): void => {
+      if (status === "connected") this.connectionMessage = "";
       if (status !== "connected") {
+        if (status === "disconnected") this.connectionMessage = connection.lastError;
         this.ready = false;
         this.nudgeOpenEditors();
       }
@@ -264,6 +266,8 @@ export default class LiveEditPlugin extends Plugin {
         void initialization.catch((error) => {
           if (this.connection === connection) {
             this.disconnect();
+            this.connectionMessage = String(error);
+            this.notifyConnection();
             new Notice(`LiveEdit: 파일 동기화에 실패했습니다. ${String(error)}`, 10000);
           }
         });
@@ -305,6 +309,8 @@ export default class LiveEditPlugin extends Plugin {
     } catch (error) {
       if (this.connection === connection) {
         this.disconnect();
+        this.connectionMessage = String(error);
+        this.notifyConnection();
         new Notice(`LiveEdit: 연결을 완료하지 못했습니다. ${String(error)}`, 10000);
       }
       return;

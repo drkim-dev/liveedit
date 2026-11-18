@@ -32,8 +32,9 @@ class Control {
 }
 export class Setting {
   static buttons: ButtonComponent[] = [];
+  static names: string[] = [];
   constructor(_container: unknown) {}
-  setName(_value: string): this { return this; }
+  setName(value: string): this { Setting.names.push(value); return this; }
   setDesc(_value: string): this { return this; }
   addButton(callback: (button: ButtonComponent) => void): this {
     const button = new ButtonComponent(); Setting.buttons.push(button); callback(button); return this;
