@@ -234,6 +234,7 @@ export default class LiveEditPlugin extends Plugin {
     const initialize = async (): Promise<void> => {
       if (this.connection !== connection) return;
       if (connection.roomState?.protocol !== 2) throw new Error("릴레이 서버를 0.5.0 이상으로 업데이트해주세요.");
+      if (connection.roomState.images !== 1) throw new Error("사진 공유를 사용하려면 서버도 0.8.0으로 교체해주세요.");
       if (connection.roomState.presence !== 1) throw new Error("참여 위치 기능을 사용하려면 서버도 0.7.0으로 교체해주세요.");
       if (connection.roomState.lifecycle !== 1) throw new Error("방 개설 기능을 사용하려면 서버도 0.6.0으로 교체해주세요.");
       if (isHost && !connection.roomState.host) throw new Error("서버를 실행한 PC에서 방 개설하기를 눌러주세요.");
@@ -314,7 +315,13 @@ export default class LiveEditPlugin extends Plugin {
     this.awarenessChangeHandler = refreshStatusBar;
     connection.awareness.on("change", refreshStatusBar);
     this.unsubscribeStatus = connection.onStatusChange(handleStatusChange);
-    this.unsubscribeRoom = connection.onRoomStateChange(refreshStatusBar);
+    const unsubscribeRoom = connection.onRoomStateChange(refreshStatusBar);
+    const unsubscribeNotice = connection.onNotice((message) => {
+      this.connectionMessage = message;
+      this.notifyConnection();
+      new Notice(`LiveEdit: ${message}`, 10000);
+    });
+    this.unsubscribeRoom = () => { unsubscribeRoom(); unsubscribeNotice(); };
     refreshStatusBar();
 
     connection.connect();

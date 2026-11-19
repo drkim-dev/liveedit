@@ -1,5 +1,6 @@
 import { App, Notice, TAbstractFile, TFile, TFolder } from "obsidian";
 import * as Y from "yjs";
+import { ImageSync } from "./image-sync";
 
 const FILES_KEY = "files";
 const WRITE_DEBOUNCE_MS = 400;
@@ -15,6 +16,7 @@ export class FileSync {
   private readonly paths: Y.Map<string>;
   // Keep deletion records so offline peers also remove folders on their next join.
   private readonly folders: Y.Map<boolean>;
+  private readonly imageSync: ImageSync;
   private readonly remoteFolders = new Map<string, number>();
   private readonly deletingFolders = new Set<string>();
   private knownEntries = new Map<string, Y.Text>();
@@ -43,6 +45,10 @@ export class FileSync {
     this.paths = doc.getMap<string>("filePaths");
     this.folders = doc.getMap<boolean>("folderStates");
     this.backupRoot = `.liveedit-backups/${Date.now()}-${doc.clientID}`;
+    this.imageSync = new ImageSync(doc, vault, (path) => this.isTracked(path), canPublish,
+      (path) => this.ensureParentFolder(path), (path) => this.recordParents(path),
+      (operation, strict) => this.enqueueDisk(operation, strict),
+      () => { if (!this.destroyed) void this.enqueueDisk(() => this.reconcileFolders()); }, this.backupRoot);
   }
 
   isTracked(path: string): boolean {
@@ -81,6 +87,7 @@ export class FileSync {
 
   async settled(strict = false): Promise<void> {
     for (;;) {
+      await this.imageSync.settled();
       for (const [path, timer] of this.debounceTimers) {
         window.clearTimeout(timer);
         this.debounceTimers.delete(path);
@@ -95,6 +102,7 @@ export class FileSync {
 
   async resynchronize(): Promise<void> {
     await this.pullAllFromRemote();
+    await this.imageSync.pull(!this.canSeed);
     await this.settled(true);
   }
 
@@ -145,6 +153,8 @@ export class FileSync {
     if (!this.canSeed && this.files.size === 0 && !initialized) {
       throw new Error("방장이 새 방의 초기 문서를 올린 뒤 다시 접속해주세요. 로컬 파일은 변경하지 않았습니다.");
     }
+    await this.imageSync.start(this.canSeed);
+    if (this.destroyed) return;
     if (this.files.size === 0 && this.canSeed && !initialized) {
       await this.seedFromVault();
     } else {
@@ -179,6 +189,7 @@ export class FileSync {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.imageSync.destroy();
     if (this.observing) this.files.doc!.off("afterTransaction", this.handleTransaction);
     this.observing = false;
     // Vault#off has no event-specific overloads (unlike #on), so it's typed
@@ -391,10 +402,11 @@ export class FileSync {
       if (child instanceof TFolder && this.isTrackedFolder(child.path)) await this.removeDeletedFolder(child.path, deletedRoot, allowUntracked);
     }
     if (this.destroyed || !removed() || this.folders.get(path) === true || folder.children.length) return;
-    if (Array.from(this.entries().keys()).some((file) => file.startsWith(path + "/"))) return;
+    if (this.imageSync.hasUnder(path) || Array.from(this.entries().keys()).some((file) => file.startsWith(path + "/"))) return;
     this.deletingFolders.add(path);
     try { await this.withRemoteFolders([path], () => this.vault.trash(folder, true)); }
     finally { this.deletingFolders.delete(path); }
+    await this.imageSync.restoreUnder(path);
     // A new update may arrive while the filesystem is trashing the old folder.
     // Its delete events must not remove that new shared entry; restore it afterwards.
     for (const file of this.entries().keys()) {
@@ -427,6 +439,10 @@ export class FileSync {
       this.files.doc?.transact(() => this.recordParents(`${file.path}/folder-check.md`), this);
       return;
     }
+    if (file instanceof TFile && this.imageSync.isImage(file.path)) {
+      try { await this.imageSync.publish(file); } catch (error) { this.imageSync.report(error); }
+      return;
+    }
     if (!(file instanceof TFile) || !this.isTracked(file.path)) return;
     if (this.writingRemotely.has(file.path) || this.hasText(file.path)) return;
     const content = await this.vault.read(file);
@@ -450,6 +466,7 @@ export class FileSync {
     if (file instanceof TFolder) {
       if (this.remoteFolders.has(file.path) || !this.isTrackedFolder(file.path)) return;
       this.files.doc?.transact(() => {
+        this.imageSync.deleteFolder(file.path);
         for (const path of Array.from(this.folders.keys())) {
           if (path.startsWith(file.path + "/") && this.isTrackedFolder(path)) this.folders.set(path, false);
         }
@@ -461,6 +478,7 @@ export class FileSync {
       }, this);
       return;
     }
+    if (file instanceof TFile && this.imageSync.isImage(file.path)) { this.imageSync.delete(file.path); return; }
     if (!(file instanceof TFile) || !this.isTracked(file.path)) return;
     if (this.writingRemotely.has(file.path)) return;
     const entry = this.entry(file.path);
@@ -472,6 +490,7 @@ export class FileSync {
     if (file instanceof TFolder) {
       if (this.remoteFolders.has(file.path) || (!this.isTrackedFolder(oldPath) && !this.isTrackedFolder(file.path))) return;
       this.files.doc?.transact(() => {
+        this.imageSync.rename(oldPath, file.path, true);
         const descendants = Array.from(this.folders).filter(([path, alive]) => alive && path.startsWith(oldPath + "/"));
         if (this.isTrackedFolder(oldPath)) this.folders.set(oldPath, false);
         if (this.isTrackedFolder(file.path)) this.recordParents(`${file.path}/folder-check.md`);
@@ -489,8 +508,15 @@ export class FileSync {
         }
       }, this);
       // A previously unshared folder may have moved into the shared scope.
-      for (const child of this.vault.getMarkdownFiles()) {
+      for (const child of this.vault.getAllLoadedFiles?.() ?? this.vault.getMarkdownFiles()) {
         if (child.path.startsWith(`${file.path}/`)) await this.handleLocalCreate(child);
+      }
+      return;
+    }
+    if (file instanceof TFile && (this.imageSync.isImage(oldPath) || this.imageSync.isImage(file.path))) {
+      this.imageSync.rename(oldPath, file.path);
+      if (this.imageSync.isImage(file.path)) {
+        try { await this.imageSync.publish(file); } catch (error) { this.imageSync.report(error); }
       }
       return;
     }
@@ -507,6 +533,10 @@ export class FileSync {
 
   private readonly handleLocalModify = async (file: TAbstractFile): Promise<void> => {
     if (this.destroyed || !this.canPublish()) return;
+    if (file instanceof TFile && this.imageSync.isImage(file.path)) {
+      try { await this.imageSync.publish(file); } catch (error) { this.imageSync.report(error); }
+      return;
+    }
     if (!(file instanceof TFile) || !this.isTracked(file.path)) return;
     if (this.writingRemotely.has(file.path) || this.openPaths.has(file.path)) return;
     const ytext = this.entry(file.path)?.[1];
