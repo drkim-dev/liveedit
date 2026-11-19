@@ -35,13 +35,13 @@ const httpServer = createServer((req, res) => {
       "content-type": "application/json",
       "access-control-allow-origin": "*",
     });
-    res.end(JSON.stringify({ ok: true, version: "0.8.0", rooms: rooms.size }));
+    res.end(JSON.stringify({ ok: true, version: "0.9.0", rooms: rooms.size }));
     return;
   }
   res.writeHead(404).end();
 });
 
-const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 128 * 1024 * 1024 });
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 24 * 1024 * 1024 });
 
 httpServer.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url ?? "/", "http://relay");
@@ -62,8 +62,8 @@ httpServer.on("upgrade", (req, socket, head) => {
 
   wss.handleUpgrade(req, socket, head, (ws) => {
     wss.emit("connection", ws, req);
-    if (url.searchParams.get("protocol") !== "2") {
-      ws.close(4005, "LiveEdit 플러그인을 0.5.0 이상으로 업데이트해주세요");
+    if (url.searchParams.get("protocol") !== "3") {
+      ws.close(4005, "LiveEdit 플러그인을 0.9.0으로 업데이트해주세요");
       return;
     }
     ws.on("error", (error) => console.warn("Peer error:", error.message));

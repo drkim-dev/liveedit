@@ -5,8 +5,9 @@ import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 import type { WebSocket } from "ws";
 import { randomUUID, createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, truncateSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { BlobStore } from "./blob-store.js";
 
 /** Wire format: first varUint byte selects the message kind. */
 export const MSG_SYNC = 0;
@@ -27,10 +28,12 @@ export class Room {
   private destroyed = false;
   private readonly statePath: string;
   private readonly pendingUpdates: Uint8Array[] = [];
+  private readonly blobs: BlobStore;
 
   constructor(readonly name: string, private readonly onEmpty: (name: string) => void, dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
     this.statePath = join(dataDir, createHash("sha256").update(name).digest("hex") + ".yjs");
+    this.blobs = new BlobStore(dataDir, name);
     try {
       if (existsSync(this.statePath)) Y.applyUpdate(this.doc, readFileSync(this.statePath));
       const journalPath = this.statePath + ".journal";
@@ -52,47 +55,36 @@ export class Room {
       throw error;
     }
     this.awareness.setLocalState(null);
-    const images = this.doc.getMap<Uint8Array>("images");
-    const imagePaths = this.doc.getMap<string>("imagePaths");
-    let acceptedImages = new Map(images);
+    // 0.8.0 stored all image bytes inside Yjs. Move them to individual files
+    // before admitting peers so reconnects receive only lightweight references.
+    const legacy = this.doc.getMap<Uint8Array>("images");
+    const references = this.doc.getMap<string>("imageRefs");
+    const paths = this.doc.getMap<string>("imagePaths");
+    if (legacy.size) {
+      const journalPath = this.statePath + ".journal";
+      if (existsSync(this.statePath) && !existsSync(this.statePath + ".pre-0.9.0"))
+        copyFileSync(this.statePath, this.statePath + ".pre-0.9.0");
+      if (existsSync(journalPath) && !existsSync(journalPath + ".pre-0.9.0"))
+        copyFileSync(journalPath, journalPath + ".pre-0.9.0");
+      for (const [id, bytes] of legacy) {
+        if (bytes instanceof Uint8Array && paths.has(id)) {
+          const hash = BlobStore.hash(bytes);
+          this.blobs.put(hash, bytes);
+          references.set(id, hash);
+        }
+      }
+      this.doc.transact(() => { for (const id of Array.from(legacy.keys())) legacy.delete(id); }, "image-migration");
+      writeFileSync(this.statePath + ".tmp", Y.encodeStateAsUpdate(this.doc));
+      renameSync(this.statePath + ".tmp", this.statePath);
+      if (existsSync(journalPath)) truncateSync(journalPath, 0);
+    }
+    // Never accept a reference to bytes that were not saved first.
     this.doc.on("afterTransaction", (transaction: Y.Transaction) => {
-      const imageChange = Array.from(transaction.changed).find(([type]) => (type as unknown) === images);
-      const pathChange = Array.from(transaction.changed).find(([type]) => (type as unknown) === imagePaths);
-      if (!imageChange && !pathChange) return;
-      const orphaned = Array.from(images.keys()).filter((id) => !imagePaths.has(id));
-      if (orphaned.length) {
-        this.doc.transact(() => {
-          for (const id of orphaned) { images.delete(id); acceptedImages.delete(id); }
-        }, "image-orphan");
-      }
-      let total = Array.from(images.values()).reduce((sum, bytes) => sum + (bytes instanceof Uint8Array ? bytes.length : 0), 0);
-      const rejected: string[] = [];
-      const changed = imageChange?.[1] ?? new Set<string>();
-      for (const id of changed) {
-        if (typeof id !== "string") continue;
-        const bytes = images.get(id);
-        if (!(bytes instanceof Uint8Array)) continue;
-        if (bytes.length > 20 * 1024 * 1024 || total > 64 * 1024 * 1024) {
-          const previous = acceptedImages.get(id);
-          if (previous && previous.length >= bytes.length && bytes.length <= 20 * 1024 * 1024) continue;
-          total += (previous?.length ?? 0) - bytes.length; rejected.push(id);
-        }
-      }
-      if (!rejected.length) { acceptedImages = new Map(images); return; }
-      this.doc.transact(() => {
-        for (const id of rejected) {
-          const previous = acceptedImages.get(id);
-          if (previous) images.set(id, previous);
-          else { images.delete(id); this.doc.getMap("imagePaths").delete(id); }
-        }
-      }, "image-limit");
-      acceptedImages = new Map(images);
-      const peer = transaction.origin as WebSocket | null;
-      if (peer && this.peers.has(peer) && peer.readyState === peer.OPEN) {
-        const encoder = encoding.createEncoder(); encoding.writeVarUint(encoder, 4);
-        encoding.writeVarString(encoder, "사진 공유 한도를 초과했습니다 (한 장 20MB, 방 전체 64MB). 제외된 사진은 로컬 백업에서 확인하세요.");
-        peer.send(encoding.toUint8Array(encoder));
-      }
+      if (!Array.from(transaction.changed.keys()).some((type) => (type as unknown) === references)) return;
+      const missing = Array.from(references).filter(([id, hash]) => !paths.has(id) || typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash) || !this.blobs.has(hash));
+      if (missing.length) this.doc.transact(() => {
+        for (const [id] of missing) { references.delete(id); paths.delete(id); }
+      }, "missing-image");
     });
     this.doc.on("update", (update: Uint8Array, origin: unknown) => {
       this.pendingUpdates.push(update);
@@ -260,6 +252,26 @@ export class Room {
           }
         }
       }
+    } else if (type === 5) {
+      const hash = decoding.readVarString(decoder);
+      const bytes = decoding.readVarUint8Array(decoder);
+      this.blobs.put(hash, bytes);
+      const reply = encoding.createEncoder();
+      encoding.writeVarUint(reply, 8); encoding.writeVarString(reply, hash);
+      ws.send(encoding.toUint8Array(reply));
+    } else if (type === 6) {
+      const hash = decoding.readVarString(decoder);
+      const bytes = this.blobs.get(hash);
+      if (!bytes) {
+        const reply = encoding.createEncoder();
+        encoding.writeVarUint(reply, 9); encoding.writeVarString(reply, hash);
+        ws.send(encoding.toUint8Array(reply));
+        return;
+      }
+      const reply = encoding.createEncoder();
+      encoding.writeVarUint(reply, 7); encoding.writeVarString(reply, hash);
+      encoding.writeVarUint8Array(reply, bytes);
+      ws.send(encoding.toUint8Array(reply));
     }
   }
 
@@ -271,7 +283,7 @@ export class Room {
       if (ws.readyState !== ws.OPEN) continue;
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, 2);
-      encoding.writeVarString(encoder, JSON.stringify({ protocol: 2, lifecycle: 1, presence: 1, images: 1, selfId: identity.id, host: identity.host, locked: this.locked, peers }));
+      encoding.writeVarString(encoder, JSON.stringify({ protocol: 3, lifecycle: 1, presence: 1, images: 2, selfId: identity.id, host: identity.host, locked: this.locked, peers }));
       ws.send(encoding.toUint8Array(encoder));
     }
   }
@@ -283,8 +295,8 @@ export class Room {
     const journalPath = this.statePath + ".journal";
     const journalSize = existsSync(journalPath) ? statSync(journalPath).size : 0;
     const update = this.pendingUpdates.length ? Y.mergeUpdates(this.pendingUpdates) : new Uint8Array();
-    if (this.doc.getMap("images").size && existsSync(this.statePath) && journalSize + update.length + 4 < 64 * 1024 * 1024) {
-      // With photos, append small editing deltas instead of re-encoding all image data per keystroke.
+    if (this.doc.getMap("imageRefs").size && existsSync(this.statePath) && journalSize + update.length + 4 < 64 * 1024 * 1024) {
+      // This is a journal checkpoint threshold, not a photo storage limit.
       const frame = Buffer.allocUnsafe(update.length + 4);
       frame.writeUInt32BE(update.length, 0); frame.set(update, 4);
       try { appendFileSync(journalPath, frame); }
