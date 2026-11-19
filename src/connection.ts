@@ -61,6 +61,8 @@ export class LiveEditConnection {
   roomState: RoomState | null = null;
   lastError = "";
   private readonly noticeListeners = new Set<(message: string) => void>();
+  private readonly uploads = new Map<string, { resolve: () => void; reject: (error: Error) => void; timer: number }[]>();
+  private readonly downloads = new Map<string, { resolve: (bytes: Uint8Array) => void; reject: (error: Error) => void; timer: number }[]>();
   onNotice(callback: (message: string) => void): () => void {
     this.noticeListeners.add(callback); return () => this.noticeListeners.delete(callback);
   }
@@ -76,7 +78,7 @@ export class LiveEditConnection {
 
   constructor(private url: string, private autoReconnect: boolean, private readonly resetOnReconnect = false) {
     const address = new URL(url);
-    address.searchParams.set("protocol", "2");
+    address.searchParams.set("protocol", "3");
     this.url = address.toString();
     this.bindDocument();
   }
@@ -167,6 +169,7 @@ export class LiveEditConnection {
     this.synced = false;
     this.ws?.close();
     this.ws = null;
+    this.failBlobRequests();
     this.roomState = null;
     this.clearRemoteAwareness();
     this.setStatus("disconnected");
@@ -241,6 +244,7 @@ export class LiveEditConnection {
     ws.onclose = (event) => {
       if (this.ws !== ws) return; // stale handler from a previous socket
       this.ws = null;
+      this.failBlobRequests();
       if (this.connectTimeout !== null) window.clearTimeout(this.connectTimeout);
       this.connectTimeout = null;
       if (this.watchdog !== null) window.clearInterval(this.watchdog);
@@ -300,6 +304,21 @@ export class LiveEditConnection {
     } else if (type === 4) {
       const message = decoding.readVarString(decoder);
       for (const callback of this.noticeListeners) callback(message);
+    } else if (type === 7) {
+      const hash = decoding.readVarString(decoder);
+      const bytes = decoding.readVarUint8Array(decoder);
+      for (const request of this.downloads.get(hash) ?? []) { window.clearTimeout(request.timer); request.resolve(bytes); }
+      this.downloads.delete(hash);
+    } else if (type === 8) {
+      const hash = decoding.readVarString(decoder);
+      for (const request of this.uploads.get(hash) ?? []) { window.clearTimeout(request.timer); request.resolve(); }
+      this.uploads.delete(hash);
+    } else if (type === 9) {
+      const hash = decoding.readVarString(decoder);
+      for (const request of this.downloads.get(hash) ?? []) {
+        window.clearTimeout(request.timer); request.reject(new Error("서버에서 사진 파일을 찾지 못했습니다. 서버 data 폴더를 확인해주세요."));
+      }
+      this.downloads.delete(hash);
     } else if (type === 3) {
       this.send(new Uint8Array([3]));
     }
@@ -311,6 +330,37 @@ export class LiveEditConnection {
     encoding.writeVarUint(encoder, MSG_SYNC);
     syncProtocol.writeUpdate(encoder, update);
     this.send(encoding.toUint8Array(encoder));
+  }
+
+  private failBlobRequests(): void {
+    const error = new Error("사진 전송 중 연결이 끊겼습니다.");
+    for (const requests of this.uploads.values()) for (const request of requests) { window.clearTimeout(request.timer); request.reject(error); }
+    for (const requests of this.downloads.values()) for (const request of requests) { window.clearTimeout(request.timer); request.reject(error); }
+    this.uploads.clear(); this.downloads.clear();
+  }
+
+  putBlob(hash: string, bytes: Uint8Array): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.synced) return Promise.reject(new Error("사진 전송 연결이 없습니다."));
+    return new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => { this.uploads.delete(hash); reject(new Error("사진 업로드 시간 초과")); }, 120000);
+      const request = { resolve, reject, timer };
+      this.uploads.set(hash, [...(this.uploads.get(hash) ?? []), request]);
+      const encoder = encoding.createEncoder();
+      encoding.writeVarUint(encoder, 5); encoding.writeVarString(encoder, hash); encoding.writeVarUint8Array(encoder, bytes);
+      this.send(encoding.toUint8Array(encoder));
+    });
+  }
+
+  getBlob(hash: string): Promise<Uint8Array> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.synced) return Promise.reject(new Error("사진 전송 연결이 없습니다."));
+    return new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => { this.downloads.delete(hash); reject(new Error("사진 다운로드 시간 초과")); }, 120000);
+      const request = { resolve, reject, timer };
+      this.downloads.set(hash, [...(this.downloads.get(hash) ?? []), request]);
+      const encoder = encoding.createEncoder();
+      encoding.writeVarUint(encoder, 6); encoding.writeVarString(encoder, hash);
+      this.send(encoding.toUint8Array(encoder));
+    });
   }
 
   private sendAwareness(ids: number[]): void {

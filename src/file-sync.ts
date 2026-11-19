@@ -1,6 +1,7 @@
 import { App, Notice, TAbstractFile, TFile, TFolder } from "obsidian";
 import * as Y from "yjs";
 import { ImageSync } from "./image-sync";
+import { BlobImageSync, type BlobTransport } from "./blob-image-sync";
 
 const FILES_KEY = "files";
 const WRITE_DEBOUNCE_MS = 400;
@@ -16,7 +17,7 @@ export class FileSync {
   private readonly paths: Y.Map<string>;
   // Keep deletion records so offline peers also remove folders on their next join.
   private readonly folders: Y.Map<boolean>;
-  private readonly imageSync: ImageSync;
+  private readonly imageSync: ImageSync | BlobImageSync;
   private readonly remoteFolders = new Map<string, number>();
   private readonly deletingFolders = new Set<string>();
   private knownEntries = new Map<string, Y.Text>();
@@ -40,15 +41,19 @@ export class FileSync {
     private readonly drafts = new Map<string, string>(),
     private readonly canPublish: () => boolean = () => true,
     private readonly vault: App["vault"] = app.vault,
+    transport?: BlobTransport,
   ) {
     this.files = doc.getMap<Y.Text>(FILES_KEY);
     this.paths = doc.getMap<string>("filePaths");
     this.folders = doc.getMap<boolean>("folderStates");
     this.backupRoot = `.liveedit-backups/${Date.now()}-${doc.clientID}`;
-    this.imageSync = new ImageSync(doc, vault, (path) => this.isTracked(path), canPublish,
-      (path) => this.ensureParentFolder(path), (path) => this.recordParents(path),
-      (operation, strict) => this.enqueueDisk(operation, strict),
-      () => { if (!this.destroyed) void this.enqueueDisk(() => this.reconcileFolders()); }, this.backupRoot);
+    const callbacks = [(path: string) => this.isTracked(path), canPublish,
+      (path: string) => this.ensureParentFolder(path), (path: string) => this.recordParents(path),
+      (operation: () => Promise<void>, strict?: boolean) => this.enqueueDisk(operation, strict),
+      () => { if (!this.destroyed) void this.enqueueDisk(() => this.reconcileFolders()); }] as const;
+    this.imageSync = transport
+      ? new BlobImageSync(doc, vault, transport, ...callbacks, this.backupRoot)
+      : new ImageSync(doc, vault, ...callbacks, this.backupRoot);
   }
 
   isTracked(path: string): boolean {

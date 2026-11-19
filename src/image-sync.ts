@@ -2,7 +2,6 @@ import { Notice, TFile, type Vault } from "obsidian";
 import * as Y from "yjs";
 
 export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
-export const MAX_ROOM_IMAGE_BYTES = 64 * 1024 * 1024;
 const sameBytes = (a: Uint8Array, b: Uint8Array): boolean => a.length === b.length && a.every((value, index) => value === b[index]);
 const buffer = (bytes: Uint8Array): ArrayBuffer => new Uint8Array(bytes).buffer;
 type ImageEntry = { id: string; bytes: Uint8Array };
@@ -97,9 +96,7 @@ export class ImageSync {
       await this.enqueue(async () => { await this.backup(path, bytes); await this.write(path); });
       return;
     }
-    const total = Array.from(this.images.values()).reduce((sum, data) => sum + (data instanceof Uint8Array ? data.length : 0), 0);
     if (bytes.length > MAX_IMAGE_BYTES) throw new Error(`사진 한 장은 20MB까지 공유할 수 있습니다: ${path}`);
-    if (total - (current?.bytes.length ?? 0) + bytes.length > MAX_ROOM_IMAGE_BYTES) throw new Error("방의 사진 공유 용량(64MB)이 가득 찼습니다.");
     this.doc.transact(() => {
       const id = current?.id ?? (this.images.has(path) ? `${this.doc.clientID}:${Date.now()}:${++this.sequence}` : path);
       if (!current) this.recordParents(path);
