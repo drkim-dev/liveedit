@@ -38,6 +38,48 @@ export class Room {
       throw error;
     }
     this.awareness.setLocalState(null);
+    const images = this.doc.getMap<Uint8Array>("images");
+    const imagePaths = this.doc.getMap<string>("imagePaths");
+    let acceptedImages = new Map(images);
+    this.doc.on("afterTransaction", (transaction: Y.Transaction) => {
+      const imageChange = Array.from(transaction.changed).find(([type]) => (type as unknown) === images);
+      const pathChange = Array.from(transaction.changed).find(([type]) => (type as unknown) === imagePaths);
+      if (!imageChange && !pathChange) return;
+      const orphaned = Array.from(images.keys()).filter((id) => !imagePaths.has(id));
+      if (orphaned.length) {
+        this.doc.transact(() => {
+          for (const id of orphaned) { images.delete(id); acceptedImages.delete(id); }
+        }, "image-orphan");
+      }
+      let total = Array.from(images.values()).reduce((sum, bytes) => sum + (bytes instanceof Uint8Array ? bytes.length : 0), 0);
+      const rejected: string[] = [];
+      const changed = imageChange?.[1] ?? new Set<string>();
+      for (const id of changed) {
+        if (typeof id !== "string") continue;
+        const bytes = images.get(id);
+        if (!(bytes instanceof Uint8Array)) continue;
+        if (bytes.length > 20 * 1024 * 1024 || total > 64 * 1024 * 1024) {
+          const previous = acceptedImages.get(id);
+          if (previous && previous.length >= bytes.length && bytes.length <= 20 * 1024 * 1024) continue;
+          total += (previous?.length ?? 0) - bytes.length; rejected.push(id);
+        }
+      }
+      if (!rejected.length) { acceptedImages = new Map(images); return; }
+      this.doc.transact(() => {
+        for (const id of rejected) {
+          const previous = acceptedImages.get(id);
+          if (previous) images.set(id, previous);
+          else { images.delete(id); this.doc.getMap("imagePaths").delete(id); }
+        }
+      }, "image-limit");
+      acceptedImages = new Map(images);
+      const peer = transaction.origin as WebSocket | null;
+      if (peer && this.peers.has(peer) && peer.readyState === peer.OPEN) {
+        const encoder = encoding.createEncoder(); encoding.writeVarUint(encoder, 4);
+        encoding.writeVarString(encoder, "사진 공유 한도를 초과했습니다 (한 장 20MB, 방 전체 64MB). 제외된 사진은 로컬 백업에서 확인하세요.");
+        peer.send(encoding.toUint8Array(encoder));
+      }
+    });
     this.doc.on("update", (update: Uint8Array, origin: unknown) => {
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, MSG_SYNC);
@@ -214,7 +256,7 @@ export class Room {
       if (ws.readyState !== ws.OPEN) continue;
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, 2);
-      encoding.writeVarString(encoder, JSON.stringify({ protocol: 2, lifecycle: 1, presence: 1, selfId: identity.id, host: identity.host, locked: this.locked, peers }));
+      encoding.writeVarString(encoder, JSON.stringify({ protocol: 2, lifecycle: 1, presence: 1, images: 1, selfId: identity.id, host: identity.host, locked: this.locked, peers }));
       ws.send(encoding.toUint8Array(encoder));
     }
   }
