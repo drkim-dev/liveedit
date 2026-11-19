@@ -24,9 +24,16 @@ export function memoryVault(initial = {}, FileClass = TFile, FolderClass = TFold
     on(name, callback) { if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name).add(callback); },
     off(name, callback) { listeners.get(name)?.delete(callback); },
     getAllLoadedFiles: () => [...entries.values()],
+    getFiles: () => [...entries.values()].filter((file) => file instanceof FileClass),
     getMarkdownFiles: () => [...entries.values()].filter((file) => file instanceof FileClass && file.path.endsWith(".md")),
     getAbstractFileByPath: (path) => entries.get(path),
     read: async (file) => contents.get(file.path) ?? "",
+    readBinary: async (file) => {
+      const value = contents.get(file.path);
+      return value instanceof Uint8Array ? new Uint8Array(value).buffer : new TextEncoder().encode(value ?? "").buffer;
+    },
+    createBinary: async (path, data) => vault.create(path, new Uint8Array(data).slice()),
+    modifyBinary: async (file, data) => vault.modify(file, new Uint8Array(data).slice()),
     createFolder: async (path) => {
       const parts = path.split("/");
       for (let index = 1; index <= parts.length; index++) {

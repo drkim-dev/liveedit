@@ -597,7 +597,14 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     // Cross the first heartbeat: the client must reply without being disconnected.
     await pause(20500);
     assert.equal(host.status, "connected");
+    const photoBytes = new Uint8Array(17 * 1024 * 1024); photoBytes[0] = 137; photoBytes[photoBytes.length - 1] = 99;
+    host.doc.transact(() => {
+      host.doc.getMap("images").set("Photos/large.png", photoBytes);
+      host.doc.getMap("imagePaths").set("Photos/large.png", "Photos/large.png");
+    });
     const liveMember = client(); await liveMember.waitUntilSynced();
+    await until(() => liveMember.doc.getMap("images").get("Photos/large.png")?.length === photoBytes.length);
+    assert.equal(liveMember.doc.getMap("images").get("Photos/large.png").at(-1), 99);
     host.disconnect();
     await until(() => liveMember.status === "disconnected");
     assert.match(liveMember.lastError, /방장이 방을 닫았/);
@@ -609,6 +616,8 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     const recovered = client(true);
     await recovered.waitUntilSynced();
     assert.equal(recovered.doc.getMap("files").get("Team/test.md").toString(), "fresh remote initial");
+    assert.equal(recovered.doc.getMap("images").get("Photos/large.png").length, 17 * 1024 * 1024);
+    assert.equal(recovered.doc.getMap("images").get("Photos/large.png").at(-1), 99);
     assert.equal(recovered.doc.getMap("filePaths").get("Team/test.md"), "Team/moved.md");
   } finally {
     plugin?.disconnect();
@@ -702,12 +711,12 @@ test("concurrent folder deletion and edits do not resurrect old notes or erase c
 });
 
 test("remote folder deletion retains local attachments, hidden files and unrelated folders", async () => {
-  const env = await folderPeers(undefined, { "Team/Sub/image.png": "attachment", "Team/Sub/.private.md": "hidden", "Other/personal.md": "private" });
+  const env = await folderPeers(undefined, { "Team/Sub/document.pdf": "attachment", "Team/Sub/.private.md": "hidden", "Other/personal.md": "private" });
   const { va, vb } = env;
   try {
     await va.vault.trash(va.entries.get("Team/Sub")); await env.settle();
     assert.equal(vb.contents.has("Team/Sub/note.md"), false);
-    assert.equal(vb.contents.get("Team/Sub/image.png"), "attachment");
+    assert.equal(vb.contents.get("Team/Sub/document.pdf"), "attachment");
     assert.equal(vb.contents.get("Team/Sub/.private.md"), "hidden");
     assert.equal(vb.contents.get("Other/personal.md"), "private");
     assert.ok(vb.entries.has("Team/Sub"));
@@ -740,4 +749,153 @@ test("a new shared note arriving during folder trash is restored without publish
     assert.equal(vb.contents.get("Team/Sub/new.md"), "new data");
     assert.equal(vb.contents.has("Team/Sub/note.md"), false);
   } finally { releaseTrash?.(); await env.close(); }
+});
+
+
+const png = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64"));
+async function imagePeers(extraRemote = {}) {
+  const a = new Y.Doc(), b = new Y.Doc();
+  const va = memoryVault({ "Team/note.md": "![[Photos/original.png]]", "Team/Photos/original.png": png });
+  const vb = memoryVault({ "Team/note.md": "stale", ...extraRemote });
+  const sa = new FileSync({ vault: va.vault }, a, () => "Team", true);
+  await sa.start(); Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+  let editable = true, online = true;
+  const sb = new FileSync({ vault: vb.vault }, b, () => "Team", false, new Map(), () => editable);
+  await sb.start();
+  a.on("update", (update, origin) => { if (online && origin !== "wire") Y.applyUpdate(b, update, "wire"); });
+  b.on("update", (update, origin) => { if (online && origin !== "wire") Y.applyUpdate(a, update, "wire"); });
+  return { a, b, va, vb, sa, sb, setEditable(value) { editable = value; }, offline() { online = false; },
+    exchange() { Y.applyUpdate(a, Y.encodeStateAsUpdate(b), "wire"); Y.applyUpdate(b, Y.encodeStateAsUpdate(a), "wire"); },
+    async settle() { await sa.settled(true); await sb.settled(true); },
+    async close() { sa.destroy(); sb.destroy(); await sa.settled(); await sb.settled(); a.destroy(); b.destroy(); } };
+}
+
+test("photos pasted by host and member copy as binary to the same paths without changing markdown links", async () => {
+  const env = await imagePeers(); const { a, b, va, vb } = env;
+  try {
+    assert.deepEqual(vb.contents.get("Team/Photos/original.png"), png);
+    assert.equal(vb.contents.get("Team/note.md"), "![[Photos/original.png]]");
+    await Promise.all([
+      va.vault.createBinary("Team/Photos/from-host.jpg", Uint8Array.from([255,216,0,255,217]).buffer),
+      vb.vault.createBinary("Team/Photos/from-member.webp", Uint8Array.from([82,73,70,70,0,255]).buffer),
+    ]);
+    await env.settle();
+    assert.deepEqual(va.contents.get("Team/Photos/from-member.webp"), vb.contents.get("Team/Photos/from-member.webp"));
+    assert.deepEqual(va.contents.get("Team/Photos/from-host.jpg"), vb.contents.get("Team/Photos/from-host.jpg"));
+    assert.equal(a.getMap("images").size, 3); assert.equal(b.getMap("images").size, 3);
+    const before = Y.encodeStateAsUpdate(a).length;
+    await env.settle(); assert.equal(Y.encodeStateAsUpdate(a).length, before, "remote writes do not echo as new uploads");
+    await vb.vault.trash(vb.entries.get("Team/Photos/from-host.jpg")); await env.settle();
+    assert.equal(va.contents.has("Team/Photos/from-host.jpg"), false);
+    assert.ok([...va.contents].some(([path, bytes]) => path.startsWith(".liveedit-backups/") && bytes instanceof Uint8Array && bytes[0] === 255));
+  } finally { await env.close(); }
+});
+
+test("photo folder rename preserves binary identity and folder deletion removes shared photos", async () => {
+  const env = await imagePeers(); const { a, b, va, vb } = env;
+  try {
+    const id = [...a.getMap("images").keys()][0];
+    await vb.vault.rename(vb.entries.get("Team/Photos"), "Team/Pictures"); await env.settle();
+    assert.equal(a.getMap("imagePaths").get(id), "Team/Pictures/original.png");
+    assert.deepEqual(va.contents.get("Team/Pictures/original.png"), png);
+    assert.equal(va.entries.has("Team/Photos"), false);
+    await va.vault.trash(va.entries.get("Team/Pictures")); await env.settle();
+    assert.equal(vb.entries.has("Team/Pictures"), false);
+    assert.equal(b.getMap("images").size, 0);
+  } finally { await env.close(); }
+});
+
+test("offline photo changes are backed up and reconnect restores the shared bytes", async () => {
+  const env = await imagePeers({ "Other/private.jpg": Uint8Array.from([1,2,3]), ".obsidian/private.png": Uint8Array.from([4,5,6]) });
+  const { vb, sb, a } = env;
+  try {
+    env.setEditable(false);
+    await vb.vault.modifyBinary(vb.entries.get("Team/Photos/original.png"), Uint8Array.from([9,8,7]).buffer);
+    await vb.vault.createBinary("Team/offline.png", Uint8Array.from([6,5,4]).buffer);
+    assert.deepEqual(a.getMap("images").get("Team/Photos/original.png"), png);
+    await sb.resynchronize(); await env.settle();
+    assert.deepEqual(vb.contents.get("Team/Photos/original.png"), png);
+    assert.equal(vb.entries.has("Team/offline.png"), false);
+    assert.ok([...vb.contents].some(([path, bytes]) => path.startsWith(".liveedit-backups/") && bytes instanceof Uint8Array && bytes[0] === 9));
+    assert.deepEqual(vb.contents.get("Other/private.jpg"), Uint8Array.from([1,2,3]));
+    assert.deepEqual(vb.contents.get(".obsidian/private.png"), Uint8Array.from([4,5,6]));
+  } finally { await env.close(); }
+});
+
+test("a delayed local photo read cannot overwrite newer shared image bytes", async () => {
+  const env = await imagePeers(); const { va, vb } = env;
+  const originalRead = vb.vault.readBinary;
+  let release;
+  try {
+    vb.vault.readBinary = () => new Promise((resolve) => release = resolve);
+    const pending = vb.vault.modifyBinary(vb.entries.get("Team/Photos/original.png"), Uint8Array.from([7,7]).buffer);
+    await until(() => !!release);
+    vb.vault.readBinary = originalRead;
+    await va.vault.modifyBinary(va.entries.get("Team/Photos/original.png"), Uint8Array.from([8,8,8]).buffer);
+    release(Uint8Array.from([7,7]).buffer); await pending; await env.settle();
+    assert.deepEqual(vb.contents.get("Team/Photos/original.png"), Uint8Array.from([8,8,8]));
+    assert.deepEqual(va.contents.get("Team/Photos/original.png"), Uint8Array.from([8,8,8]));
+    assert.ok([...vb.contents].some(([path, bytes]) => path.startsWith(".liveedit-backups/") && bytes instanceof Uint8Array && bytes[0] === 7));
+  } finally { vb.vault.readBinary = originalRead; release?.(png.buffer); await env.close(); }
+});
+
+test("photo read followed by deletion cannot resurrect the attachment", async () => {
+  const env = await imagePeers(); const { vb, a } = env;
+  const originalRead = vb.vault.readBinary; let release;
+  try {
+    vb.vault.readBinary = () => new Promise((resolve) => release = resolve);
+    const pending = vb.vault.createBinary("Team/racing.png", Uint8Array.from([1,2]).buffer);
+    await until(() => !!release);
+    vb.vault.readBinary = originalRead;
+    await vb.vault.trash(vb.entries.get("Team/racing.png")); release(Uint8Array.from([1,2]).buffer);
+    await pending; await env.settle();
+    assert.equal(a.getMap("images").has("Team/racing.png"), false);
+  } finally { vb.vault.readBinary = originalRead; release?.(png.buffer); await env.close(); }
+});
+
+
+
+test("concurrent photo creation converges and rename plus replacement preserves the shared image", async () => {
+  const env = await imagePeers(); const { va, vb, a, b } = env;
+  try {
+    env.offline();
+    await va.vault.createBinary("Team/same.png", Uint8Array.from([1,2,3]).buffer);
+    await vb.vault.createBinary("Team/same.png", Uint8Array.from([4,5,6]).buffer);
+    env.exchange(); await env.settle();
+    assert.deepEqual(va.contents.get("Team/same.png"), vb.contents.get("Team/same.png"));
+    assert.ok([...va.contents, ...vb.contents].some(([path, bytes]) => path.startsWith(".liveedit-backups/") && bytes instanceof Uint8Array && [1,4].includes(bytes[0])));
+    await va.vault.rename(va.entries.get("Team/Photos/original.png"), "Team/Photos/renamed.png");
+    await vb.vault.modifyBinary(vb.entries.get("Team/Photos/original.png"), Uint8Array.from([7,8,9]).buffer);
+    env.exchange(); await env.settle();
+    for (const fixture of [va, vb]) {
+      assert.deepEqual(fixture.contents.get("Team/Photos/renamed.png"), Uint8Array.from([7,8,9]));
+      assert.equal(fixture.entries.has("Team/Photos/original.png"), false);
+    }
+    assert.deepEqual(a.getMap("imagePaths").toJSON(), b.getMap("imagePaths").toJSON());
+  } finally { await env.close(); }
+});
+
+test("an oversized photo remains local and does not stop note collaboration", async () => {
+  const env = await imagePeers(); const { va, a } = env;
+  try {
+    await va.vault.createBinary("Team/too-large.png", new Uint8Array(21 * 1024 * 1024).buffer);
+    await env.settle();
+    assert.ok(va.entries.has("Team/too-large.png"));
+    assert.equal(a.getMap("images").has("Team/too-large.png"), false);
+    assert.equal(a.getMap("files").get("Team/note.md").toString(), "![[Photos/original.png]]");
+  } finally { await env.close(); }
+});
+
+
+test("deleting a photo while another peer replaces its bytes does not resurrect the photo", async () => {
+  const env = await imagePeers(); const { va, vb } = env;
+  try {
+    env.offline();
+    await va.vault.trash(va.entries.get("Team/Photos/original.png"));
+    await vb.vault.modifyBinary(vb.entries.get("Team/Photos/original.png"), Uint8Array.from([10,11,12]).buffer);
+    env.exchange(); await env.settle();
+    assert.equal(va.entries.has("Team/Photos/original.png"), false);
+    assert.equal(vb.entries.has("Team/Photos/original.png"), false);
+    assert.ok([...vb.contents].some(([path, bytes]) => path.startsWith(".liveedit-backups/") && bytes instanceof Uint8Array && bytes[0] === 10));
+  } finally { await env.close(); }
 });

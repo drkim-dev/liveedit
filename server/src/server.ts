@@ -35,13 +35,13 @@ const httpServer = createServer((req, res) => {
       "content-type": "application/json",
       "access-control-allow-origin": "*",
     });
-    res.end(JSON.stringify({ ok: true, version: "0.7.0", rooms: rooms.size }));
+    res.end(JSON.stringify({ ok: true, version: "0.8.0", rooms: rooms.size }));
     return;
   }
   res.writeHead(404).end();
 });
 
-const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 16 * 1024 * 1024 });
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 128 * 1024 * 1024 });
 
 httpServer.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url ?? "/", "http://relay");

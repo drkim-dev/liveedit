@@ -12,6 +12,7 @@ export interface RoomState {
   protocol: number;
   lifecycle?: number;
   presence?: number;
+  images?: number;
   selfId?: string;
   host: boolean;
   locked: boolean;
@@ -59,6 +60,10 @@ export class LiveEditConnection {
   private attempts = 0;
   roomState: RoomState | null = null;
   lastError = "";
+  private readonly noticeListeners = new Set<(message: string) => void>();
+  onNotice(callback: (message: string) => void): () => void {
+    this.noticeListeners.add(callback); return () => this.noticeListeners.delete(callback);
+  }
   private readonly roomListeners = new Set<() => void>();
   onRoomStateChange(callback: () => void): () => void {
     this.roomListeners.add(callback);
@@ -292,6 +297,9 @@ export class LiveEditConnection {
         this.awareness.setLocalStateField("user", { name: self.name, color: self.color });
       }
       for (const callback of this.roomListeners) callback();
+    } else if (type === 4) {
+      const message = decoding.readVarString(decoder);
+      for (const callback of this.noticeListeners) callback(message);
     } else if (type === 3) {
       this.send(new Uint8Array([3]));
     }

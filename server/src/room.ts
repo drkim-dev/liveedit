@@ -5,7 +5,7 @@ import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 import type { WebSocket } from "ws";
 import { randomUUID, createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** Wire format: first varUint byte selects the message kind. */
@@ -26,19 +26,76 @@ export class Room {
   private locked = false;
   private destroyed = false;
   private readonly statePath: string;
+  private readonly pendingUpdates: Uint8Array[] = [];
 
   constructor(readonly name: string, private readonly onEmpty: (name: string) => void, dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
     this.statePath = join(dataDir, createHash("sha256").update(name).digest("hex") + ".yjs");
     try {
       if (existsSync(this.statePath)) Y.applyUpdate(this.doc, readFileSync(this.statePath));
+      const journalPath = this.statePath + ".journal";
+      if (existsSync(journalPath)) {
+        const journal = readFileSync(journalPath);
+        let offset = 0;
+        while (offset + 4 <= journal.length) {
+          const length = journal.readUInt32BE(offset);
+          if (offset + 4 + length > journal.length) break;
+          Y.applyUpdate(this.doc, journal.subarray(offset + 4, offset + 4 + length));
+          offset += 4 + length;
+        }
+        // A crash can leave an incomplete final append. Preserve every complete record.
+        if (offset < journal.length) truncateSync(journalPath, offset);
+      }
     } catch (error) {
       this.awareness.destroy();
       this.doc.destroy();
       throw error;
     }
     this.awareness.setLocalState(null);
+    const images = this.doc.getMap<Uint8Array>("images");
+    const imagePaths = this.doc.getMap<string>("imagePaths");
+    let acceptedImages = new Map(images);
+    this.doc.on("afterTransaction", (transaction: Y.Transaction) => {
+      const imageChange = Array.from(transaction.changed).find(([type]) => (type as unknown) === images);
+      const pathChange = Array.from(transaction.changed).find(([type]) => (type as unknown) === imagePaths);
+      if (!imageChange && !pathChange) return;
+      const orphaned = Array.from(images.keys()).filter((id) => !imagePaths.has(id));
+      if (orphaned.length) {
+        this.doc.transact(() => {
+          for (const id of orphaned) { images.delete(id); acceptedImages.delete(id); }
+        }, "image-orphan");
+      }
+      let total = Array.from(images.values()).reduce((sum, bytes) => sum + (bytes instanceof Uint8Array ? bytes.length : 0), 0);
+      const rejected: string[] = [];
+      const changed = imageChange?.[1] ?? new Set<string>();
+      for (const id of changed) {
+        if (typeof id !== "string") continue;
+        const bytes = images.get(id);
+        if (!(bytes instanceof Uint8Array)) continue;
+        if (bytes.length > 20 * 1024 * 1024 || total > 64 * 1024 * 1024) {
+          const previous = acceptedImages.get(id);
+          if (previous && previous.length >= bytes.length && bytes.length <= 20 * 1024 * 1024) continue;
+          total += (previous?.length ?? 0) - bytes.length; rejected.push(id);
+        }
+      }
+      if (!rejected.length) { acceptedImages = new Map(images); return; }
+      this.doc.transact(() => {
+        for (const id of rejected) {
+          const previous = acceptedImages.get(id);
+          if (previous) images.set(id, previous);
+          else { images.delete(id); this.doc.getMap("imagePaths").delete(id); }
+        }
+      }, "image-limit");
+      acceptedImages = new Map(images);
+      const peer = transaction.origin as WebSocket | null;
+      if (peer && this.peers.has(peer) && peer.readyState === peer.OPEN) {
+        const encoder = encoding.createEncoder(); encoding.writeVarUint(encoder, 4);
+        encoding.writeVarString(encoder, "사진 공유 한도를 초과했습니다 (한 장 20MB, 방 전체 64MB). 제외된 사진은 로컬 백업에서 확인하세요.");
+        peer.send(encoding.toUint8Array(encoder));
+      }
+    });
     this.doc.on("update", (update: Uint8Array, origin: unknown) => {
+      this.pendingUpdates.push(update);
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, MSG_SYNC);
       syncProtocol.writeUpdate(encoder, update);
@@ -214,7 +271,7 @@ export class Room {
       if (ws.readyState !== ws.OPEN) continue;
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, 2);
-      encoding.writeVarString(encoder, JSON.stringify({ protocol: 2, lifecycle: 1, presence: 1, selfId: identity.id, host: identity.host, locked: this.locked, peers }));
+      encoding.writeVarString(encoder, JSON.stringify({ protocol: 2, lifecycle: 1, presence: 1, images: 1, selfId: identity.id, host: identity.host, locked: this.locked, peers }));
       ws.send(encoding.toUint8Array(encoder));
     }
   }
@@ -222,8 +279,23 @@ export class Room {
   flush(): void {
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = null;
-    writeFileSync(this.statePath + ".tmp", Y.encodeStateAsUpdate(this.doc));
-    renameSync(this.statePath + ".tmp", this.statePath);
+    if (!this.pendingUpdates.length && existsSync(this.statePath)) return;
+    const journalPath = this.statePath + ".journal";
+    const journalSize = existsSync(journalPath) ? statSync(journalPath).size : 0;
+    const update = this.pendingUpdates.length ? Y.mergeUpdates(this.pendingUpdates) : new Uint8Array();
+    if (this.doc.getMap("images").size && existsSync(this.statePath) && journalSize + update.length + 4 < 64 * 1024 * 1024) {
+      // With photos, append small editing deltas instead of re-encoding all image data per keystroke.
+      const frame = Buffer.allocUnsafe(update.length + 4);
+      frame.writeUInt32BE(update.length, 0); frame.set(update, 4);
+      try { appendFileSync(journalPath, frame); }
+      catch (error) { if (existsSync(journalPath)) truncateSync(journalPath, journalSize); throw error; }
+    } else {
+      writeFileSync(this.statePath + ".tmp", Y.encodeStateAsUpdate(this.doc));
+      renameSync(this.statePath + ".tmp", this.statePath);
+      // Snapshot first: replaying an older journal is safe if a crash precedes truncation.
+      if (existsSync(journalPath)) truncateSync(journalPath, 0);
+    }
+    this.pendingUpdates.length = 0;
   }
 
   destroy(): void {
