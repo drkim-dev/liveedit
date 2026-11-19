@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 import { LiveEditConnection, buildRoomUrl } from "./generated/connection.cjs";
 import { FileSync, TFile, TFolder } from "./generated/file-sync.cjs";
 import { memoryVault } from "./vault-fixture.mjs";
@@ -452,7 +453,7 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     await member.waitUntilSynced();
     assert.equal(host.roomState.host, true);
     assert.equal(member.roomState.host, false);
-    const blank = new WebSocket(address + "&protocol=2&name=%20%20&clientId=456");
+    const blank = new WebSocket(address + "&protocol=3&name=%20%20&clientId=456");
     assert.equal(await new Promise((resolve) => blank.once("close", (code) => resolve(code))), 4009);
     const extra = Array.from({ length: 14 }, () => client());
     await Promise.all(extra.map((peer) => peer.waitUntilSynced()));
@@ -510,6 +511,19 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     assert.equal(plugin.isReadOnlyPath("root.md"), false);
     assert.equal(fixture.contents.get("Team/test.md"), "remote initial");
     assert.equal(fixture.contents.has("Team/extra.md"), false);
+    const pastedPhoto = Uint8Array.from([137, 80, 78, 71, 1, 2, 3]);
+    await fixture.vault.createBinary("Team/pasted.png", pastedPhoto.buffer);
+    const pastedHash = createHash("sha256").update(pastedPhoto).digest("hex");
+    await until(() => host.doc.getMap("imageRefs").get("Team/pasted.png") === pastedHash);
+    assert.deepEqual(await host.getBlob(pastedHash), pastedPhoto);
+    const imageViewer = client(); await imageViewer.waitUntilSynced();
+    const imageVault = memoryVault();
+    const imageSync = new FileSync({ vault: imageVault.vault }, imageViewer.doc, () => "", false,
+      new Map(), () => true, imageVault.vault, imageViewer);
+    try {
+      await imageSync.start(); await imageSync.settled(true);
+      assert.deepEqual(imageVault.contents.get("Team/pasted.png"), pastedPhoto);
+    } finally { imageSync.destroy(); imageViewer.disconnect(); }
     plugin.connection.ws.terminate();
     await until(() => plugin.getConnectionStatus() === "disconnected");
     assert.equal(plugin.canEditShared(), false);
@@ -522,6 +536,7 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     await fixture.emit("modify", fixture.entries.get("Team/test.md"));
     await until(() => plugin.getConnectionStatus() === "connected" && plugin.ready);
     assert.equal(fixture.contents.get("Team/test.md"), "remote initial");
+    assert.deepEqual(fixture.contents.get("Team/pasted.png"), pastedPhoto);
     assert.equal(text.toString(), "remote initial");
     assert.ok([...fixture.contents.values()].includes("auto offline draft"));
     plugin.settings.autoReconnect = false;
@@ -560,11 +575,14 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     await pause(400);
     const stateFile = join(dataDir, readdirSync(dataDir).find((name) => name.endsWith(".yjs")));
     const beforeSave = statSync(stateFile).mtimeMs;
+    const journalFile = stateFile + ".journal";
+    const beforeJournal = readdirSync(dataDir).some((name) => name.endsWith(".journal")) ? statSync(journalFile).size : 0;
     const originalLength = text.length;
     const continuous = setInterval(() => text.insert(text.length, "."), 40);
     try {
       await pause(650);
-      assert.ok(statSync(stateFile).mtimeMs > beforeSave, "continuous editing must not postpone every disk save");
+      assert.ok(statSync(stateFile).mtimeMs > beforeSave || statSync(journalFile).size > beforeJournal,
+        "continuous editing must not postpone every disk save");
     } finally { clearInterval(continuous); }
     text.delete(originalLength, text.length - originalLength);
     host.doc.getMap("filePaths").set("Team/test.md", "Team/moved.md");
@@ -586,7 +604,7 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     await until(() => member.lastError.includes("종료"));
     await pause(2200);
     assert.equal(member.status, "disconnected", "kicked clients must not automatically rejoin");
-    const malformed = new WebSocket(address + "&protocol=2&name=Malformed&clientId=123");
+    const malformed = new WebSocket(address + "&protocol=3&name=Malformed&clientId=123");
     await new Promise((resolve) => malformed.once("open", resolve));
     const closed = new Promise((resolve) => malformed.once("close", (code) => resolve(code)));
     malformed.send(Buffer.from([0, 255]));
@@ -594,17 +612,22 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     const legacy = new WebSocket(address);
     const legacyCode = await new Promise((resolve) => legacy.once("close", (code) => resolve(code)));
     assert.equal(legacyCode, 4005, "incompatible clients cannot overwrite renamed documents");
+    const oldPhotoClient = new WebSocket(address + "&protocol=2&name=Old&clientId=125");
+    assert.equal(await new Promise((resolve) => oldPhotoClient.once("close", (code) => resolve(code))), 4005);
     // Cross the first heartbeat: the client must reply without being disconnected.
     await pause(20500);
     assert.equal(host.status, "connected");
     const photoBytes = new Uint8Array(17 * 1024 * 1024); photoBytes[0] = 137; photoBytes[photoBytes.length - 1] = 99;
+    const photoHash = createHash("sha256").update(photoBytes).digest("hex");
+    await host.putBlob(photoHash, photoBytes);
     host.doc.transact(() => {
-      host.doc.getMap("images").set("Photos/large.png", photoBytes);
+      host.doc.getMap("imageRefs").set("Photos/large.png", photoHash);
       host.doc.getMap("imagePaths").set("Photos/large.png", "Photos/large.png");
     });
     const liveMember = client(); await liveMember.waitUntilSynced();
-    await until(() => liveMember.doc.getMap("images").get("Photos/large.png")?.length === photoBytes.length);
-    assert.equal(liveMember.doc.getMap("images").get("Photos/large.png").at(-1), 99);
+    await until(() => liveMember.doc.getMap("imageRefs").get("Photos/large.png") === photoHash);
+    assert.equal((await liveMember.getBlob(photoHash)).at(-1), 99);
+    assert.ok((await liveMember.getBlob(photoHash)).length === photoBytes.length);
     host.disconnect();
     await until(() => liveMember.status === "disconnected");
     assert.match(liveMember.lastError, /방장이 방을 닫았/);
@@ -616,8 +639,8 @@ test("relay: merge, reconnect, host controls, malformed input, heartbeat, disk r
     const recovered = client(true);
     await recovered.waitUntilSynced();
     assert.equal(recovered.doc.getMap("files").get("Team/test.md").toString(), "fresh remote initial");
-    assert.equal(recovered.doc.getMap("images").get("Photos/large.png").length, 17 * 1024 * 1024);
-    assert.equal(recovered.doc.getMap("images").get("Photos/large.png").at(-1), 99);
+    assert.equal(recovered.doc.getMap("imageRefs").get("Photos/large.png"), photoHash);
+    assert.equal((await recovered.getBlob(photoHash)).at(-1), 99);
     assert.equal(recovered.doc.getMap("filePaths").get("Team/test.md"), "Team/moved.md");
   } finally {
     plugin?.disconnect();
